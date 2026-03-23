@@ -72,9 +72,19 @@ export async function waitFor(
 }
 
 /**
- * Initialize test database with required schema
+ * Initialize test database with required schema.
+ * Clears all tables first so each test starts from a clean state.
  */
 export async function initTestDatabase(db: D1Database): Promise<void> {
+  // Drop tables first to ensure clean state across test files sharing the same DB instance
+  await db.exec(`
+    DROP TABLE IF EXISTS hitl_dead_letter;
+    DROP TABLE IF EXISTS hitl_approvals;
+    DROP TABLE IF EXISTS guardrail_events;
+    DROP TABLE IF EXISTS template_changes;
+    DROP TABLE IF EXISTS prompt_audit_logs;
+  `);
+
   // Read and execute migration files
   const migration1 = `
     CREATE TABLE IF NOT EXISTS prompt_audit_logs (
