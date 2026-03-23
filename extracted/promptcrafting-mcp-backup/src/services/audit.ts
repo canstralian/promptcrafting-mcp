@@ -70,43 +70,6 @@ export async function writeGuardrailEvent(
   }
 }
 
-// ─── Write Template Change ─────────────────────────────────────────
-// Records every create/update/delete operation on templates.
-// The template_changes table exists in D1 but was never written to — this closes
-// the repudiation gap for destructive operations (STRIDE-R at B3).
-export async function writeTemplateChange(
-  db: D1Database,
-  entry: {
-    templateId: string;
-    action: "create" | "update" | "delete";
-    userId: string;
-    version: number;
-    contentHash: string;
-    hmacValid: boolean;
-  }
-): Promise<void> {
-  try {
-    await db
-      .prepare(
-        `INSERT INTO template_changes (
-          template_id, action, user_id, version, content_hash, hmac_valid, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`
-      )
-      .bind(
-        entry.templateId,
-        entry.action,
-        entry.userId,
-        entry.version,
-        entry.contentHash,
-        entry.hmacValid ? 1 : 0
-      )
-      .run();
-  } catch (err) {
-    // Non-fatal — log and continue, but surface loudly so ops can investigate.
-    console.error("[AUDIT] Failed to write template change log:", err);
-  }
-}
-
 // ─── Query Audit Logs ──────────────────────────────────────────────
 export async function queryAuditLogs(
   db: D1Database,

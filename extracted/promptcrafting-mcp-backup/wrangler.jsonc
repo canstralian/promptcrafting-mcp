@@ -72,22 +72,9 @@
 
   // ---------- Environment Variables ----------
   // Secrets set via: wrangler secret put <NAME>
-  //
-  //   JWT_SECRET        — HMAC-SHA256 key for JWT signing and verification.
-  //                       Algorithm is pinned to HS256 in src/middleware/auth.ts.
-  //                       Asymmetric algorithms (RS256/ES256) are intentionally NOT used
-  //                       here: this is a single-issuer, server-controlled service where
-  //                       the signing and verification keys are both private. HS256 avoids
-  //                       the algorithm-confusion attack surface introduced by asymmetric
-  //                       schemes when the public key is attacker-controllable.
-  //                       To rotate: generate a new secret, update via `wrangler secret put
-  //                       JWT_SECRET`, then re-issue all active tokens.
-  //
-  //   TEMPLATE_HMAC_KEY — HMAC-SHA256 key for template content signing (B3 integrity).
-  //                       Used by prompt-builder.ts signContent() and verifyContent().
-  //
-  //   OPENAI_API_KEY    — (optional) if using external OpenAI-compatible model providers
-  //                       instead of Workers AI.
+  //   JWT_SECRET        — HMAC key for JWT verification (RS256 preferred; see auth middleware)
+  //   TEMPLATE_HMAC_KEY — HMAC-SHA256 key for template content signing
+  //   OPENAI_API_KEY    — (optional) if using external model providers
   //
   // Non-secret vars:
   "vars": {

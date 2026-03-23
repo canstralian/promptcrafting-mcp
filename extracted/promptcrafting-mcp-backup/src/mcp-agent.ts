@@ -4,11 +4,6 @@
 //
 // Boundary: B2 (Controlled Execution Plane)
 // Responsibilities: tool orchestration, session state, prompt compilation, guardrail enforcement
-//
-// Changelog:
-//   - [FIX] onToolCall is now a concrete utility invoked by tool handlers, not dead code.
-//           MCP SDK does not call onToolCall automatically — callers must invoke it explicitly
-//           via the exported trackToolCall helper after each tool execution.
 
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -154,19 +149,8 @@ export class PromptMCPServer extends McpAgent<Env, AgentState> {
     );
   }
 
-  // ─── Session Tool Tracking ─────────────────────────────────────────
-  // [FIX] The MCP SDK does not call this method automatically — it must be
-  // invoked explicitly by tool handlers. This method is intentionally kept
-  // on the class (not a module-level function) because it needs access to
-  // this.sql and this.state, which are Durable Object instance members.
-  //
-  // Usage in tool handlers:
-  //   const agent = ... // obtain DO stub
-  //   await agent.trackToolCall("promptcraft_execute_prompt", inputHash, "success");
-  //
-  // In practice, tools call this via the exported trackToolCall() helper below,
-  // which receives a reference to the DO instance from the Hono request context.
-  async trackToolCall(toolName: string, inputHash: string, status: string): Promise<void> {
+  // Track tool usage in session-local SQLite
+  async onToolCall(toolName: string, inputHash: string, status: string): Promise<void> {
     this.sql`
       INSERT INTO session_history (tool_name, input_hash, status)
       VALUES (${toolName}, ${inputHash}, ${status})

@@ -2,13 +2,6 @@
 // These are registered on the McpServer inside the McpAgent Durable Object.
 //
 // Tool naming: promptcraft_{action}_{resource} (following MCP best practices)
-//
-// Changelog:
-//   - [FIX] promptcraft_create_template: now writes to template_changes audit table
-//   - [FIX] promptcraft_delete_template: now reads template before deleting (for hash),
-//           writes to template_changes audit table, fails gracefully if template not found
-//   - [FIX] All tools now import writeTemplateChange from audit service
-//   - [NOTE] onToolCall (McpAgent) must be invoked explicitly — see mcp-agent.ts
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -24,9 +17,7 @@ import {
 } from "../services/prompt-builder.js";
 import { sanitizeInput } from "../guardrails/input-sanitizer.js";
 import { validateOutput, checkCanaryToken } from "../guardrails/output-validator.js";
-import {
-  writeAuditLog, writeGuardrailEvent, writeTemplateChange, queryAuditLogs,
-} from "../services/audit.js";
+import { writeAuditLog, writeGuardrailEvent, queryAuditLogs } from "../services/audit.js";
 
 // ─── Register All Tools ────────────────────────────────────────────
 export function registerPromptTools(server: McpServer, env: Env, userId: string): void {
@@ -84,16 +75,6 @@ Returns the template ID, version, and content hash.`,
         { expirationTtl: 60 * 60 * 24 * 90 }
       );
 
-      // Audit: record creation in template_changes (closes STRIDE-R gap)
-      await writeTemplateChange(env.AUDIT_DB, {
-        templateId: template.id,
-        action: "create",
-        userId,
-        version: template.version,
-        contentHash: template.contentHash,
-        hmacValid: true, // We just signed it — by definition valid
-      });
-
       return {
         content: [{
           type: "text",
@@ -130,8 +111,8 @@ Returns the full template including all four layers and metadata.`,
       }
 
       // Verify HMAC integrity
-      const compiledContent = [raw.layers.role, raw.layers.objective, raw.layers.constraints, raw.layers.outputShape].join("\n");
-      const valid = await verifyContent(compiledContent, raw.hmacSignature, env.TEMPLATE_HMAC_KEY);
+      const compiled = [raw.layers.role, raw.layers.objective, raw.layers.constraints, raw.layers.outputShape].join("\n");
+      const valid = await verifyContent(compiled, raw.hmacSignature, env.TEMPLATE_HMAC_KEY);
       if (!valid) {
         console.error(`[SECURITY] HMAC verification failed for template ${params.templateId} — possible tampering`);
         return {
@@ -186,180 +167,19 @@ Returns the full template including all four layers and metadata.`,
     "promptcraft_delete_template",
     {
       title: "Delete Prompt Template",
-      description: `Soft-delete a prompt template by removing the primary KV key.
-Versioned copies (template:{id}:v{n}) are retained indefinitely for audit compliance.
-The deletion is recorded in the template_changes audit table in D1 with the acting user ID.
-Returns an error if the template does not exist (idempotent deletes are intentionally rejected
-to prevent silent double-delete from masking replay attacks).`,
+      description: "Delete a prompt template by ID. Versioned copies are retained for audit compliance.",
       inputSchema: DeleteTemplateSchema,
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async (params) => {
-      // [FIX] Read the template BEFORE deleting so we can:
-      //   1. Verify it actually exists (reject silent no-op deletes)
-      //   2. Capture contentHash + version for the audit record
-      //   3. Verify HMAC integrity at time of deletion (forensic value)
-      const raw = await env.PROMPT_TEMPLATES.get(`template:${params.templateId}`, "json") as PromptTemplate | null;
-
-      if (!raw) {
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Template not found: ${params.templateId}. Cannot delete a non-existent template.` }],
-        };
-      }
-
-      // Verify HMAC at time of deletion — records whether the template had already
-      // been tampered with before deletion (important forensic data point).
-      const compiledContent = [raw.layers.role, raw.layers.objective, raw.layers.constraints, raw.layers.outputShape].join("\n");
-      const hmacValid = await verifyContent(compiledContent, raw.hmacSignature, env.TEMPLATE_HMAC_KEY);
-
-      if (!hmacValid) {
-        // Log the tampering event but still allow deletion (admin may be cleaning up
-        // a poisoned template). Surface the warning prominently.
-        console.error(`[SECURITY] Deleting template ${params.templateId} with FAILED HMAC — content was tampered with before deletion`);
-      }
-
-      // Delete primary key from KV
       await env.PROMPT_TEMPLATES.delete(`template:${params.templateId}`);
-
-      // [FIX] Write deletion event to template_changes audit table
-      await writeTemplateChange(env.AUDIT_DB, {
-        templateId: params.templateId,
-        action: "delete",
-        userId,
-        version: raw.version,
-        contentHash: raw.contentHash,
-        hmacValid,
-      });
-
       return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            deleted: true,
-            id: params.templateId,
-            version: raw.version,
-            hmacValidAtDeletion: hmacValid,
-            note: "Primary key removed. Versioned copies retained for audit compliance.",
-          }),
-        }],
+        content: [{ type: "text", text: JSON.stringify({ deleted: true, id: params.templateId, note: "Versioned copies retained for audit" }) }],
       };
     }
   );
 
   // ═══════════════════════════════════════════════════════════════════
-
-  server.registerTool(
-    "promptcraft_update_template",
-    {
-      title: "Update Prompt Template",
-      description: `Update one or more layers of an existing prompt template.
-Only provided fields are changed; omitted fields retain their current values.
-The template version is incremented on every update, the new content is re-signed
-with HMAC-SHA256, and the change is recorded in the template_changes audit table.
-The previous version remains accessible via promptcraft_get_template with a version number.`,
-      inputSchema: UpdateTemplateSchema,
-      annotations: {
-        readOnlyHint: false,
-        destructiveHint: false,
-        idempotentHint: false,
-        openWorldHint: false,
-      },
-    },
-    async (params) => {
-      // 1. Load existing template
-      const existing = await env.PROMPT_TEMPLATES.get(
-        `template:${params.templateId}`, "json"
-      ) as PromptTemplate | null;
-
-      if (!existing) {
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Template not found: ${params.templateId}` }],
-        };
-      }
-
-      // 2. Verify HMAC integrity before mutating
-      const existingCompiled = [
-        existing.layers.role, existing.layers.objective,
-        existing.layers.constraints, existing.layers.outputShape,
-      ].join("\n");
-      const priorHmacValid = await verifyContent(existingCompiled, existing.hmacSignature, env.TEMPLATE_HMAC_KEY);
-
-      if (!priorHmacValid) {
-        console.error(`[SECURITY] Update rejected: HMAC verification failed for template ${params.templateId} — possible prior tampering`);
-        return {
-          isError: true,
-          content: [{ type: "text", text: "Template integrity check failed — update rejected to prevent propagating tampered content" }],
-        };
-      }
-
-      // 3. Apply partial updates
-      const updatedLayers = {
-        objective:   params.objective   ?? existing.layers.objective,
-        role:        params.role        ?? existing.layers.role,
-        constraints: params.constraints ?? existing.layers.constraints,
-        outputShape: params.outputShape ?? existing.layers.outputShape,
-      };
-
-      // 4. Re-sign updated content
-      const newCompiled = [
-        updatedLayers.role, updatedLayers.objective,
-        updatedLayers.constraints, updatedLayers.outputShape,
-      ].join("\n");
-      const newContentHash = await hashContent(newCompiled);
-      const newHmac = await signContent(newCompiled, env.TEMPLATE_HMAC_KEY);
-      const newVersion = existing.version + 1;
-
-      const updated: PromptTemplate = {
-        ...existing,
-        description: params.description ?? existing.description,
-        tags:        params.tags        ?? existing.tags,
-        model:       params.model       ?? existing.model,
-        layers:      updatedLayers,
-        contentHash: newContentHash,
-        hmacSignature: newHmac,
-        version:     newVersion,
-        updatedAt:   new Date().toISOString(),
-      };
-
-      // 5. Persist: overwrite latest + store new versioned snapshot
-      await env.PROMPT_TEMPLATES.put(
-        `template:${params.templateId}`,
-        JSON.stringify(updated),
-        { metadata: { name: updated.name, version: newVersion } }
-      );
-      await env.PROMPT_TEMPLATES.put(
-        `template:${params.templateId}:v${newVersion}`,
-        JSON.stringify(updated),
-        { expirationTtl: 60 * 60 * 24 * 90 }
-      );
-
-      // 6. Audit: record update in template_changes
-      await writeTemplateChange(env.AUDIT_DB, {
-        templateId: params.templateId,
-        action: "update",
-        userId,
-        version: newVersion,
-        contentHash: newContentHash,
-        hmacValid: true,
-      });
-
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            id: params.templateId,
-            version: newVersion,
-            contentHash: newContentHash,
-            updated: true,
-            updatedAt: updated.updatedAt,
-          }),
-        }],
-      };
-    }
-  );
-
   // PROMPT EXECUTION TOOLS
   // ═══════════════════════════════════════════════════════════════════
 
@@ -394,8 +214,8 @@ Fail-closed: if any guardrail fails, the output is NOT returned.`,
         return { isError: true, content: [{ type: "text", text: `Template not found: ${params.templateId}` }] };
       }
 
-      const compiledContent = [template.layers.role, template.layers.objective, template.layers.constraints, template.layers.outputShape].join("\n");
-      const hmacValid = await verifyContent(compiledContent, template.hmacSignature, env.TEMPLATE_HMAC_KEY);
+      const compiled = [template.layers.role, template.layers.objective, template.layers.constraints, template.layers.outputShape].join("\n");
+      const hmacValid = await verifyContent(compiled, template.hmacSignature, env.TEMPLATE_HMAC_KEY);
       if (!hmacValid) {
         await writeAuditLog(env.AUDIT_DB, {
           requestId, sessionId: null, templateId: params.templateId,
@@ -478,7 +298,7 @@ Fail-closed: if any guardrail fails, the output is NOT returned.`,
         return { isError: true, content: [{ type: "text", text: "Output blocked by security guardrails" }] };
       }
 
-      // 6. Audit log (success path)
+      // 6. Audit log (non-blocking in production via ctx.waitUntil)
       const latencyMs = Date.now() - startTime;
       await writeAuditLog(env.AUDIT_DB, {
         requestId, sessionId: null, templateId: params.templateId,
@@ -525,8 +345,8 @@ Returns sanitization results, detected threats, compiled prompt preview, and tem
       }
 
       // Verify HMAC
-      const compiledContent = [template.layers.role, template.layers.objective, template.layers.constraints, template.layers.outputShape].join("\n");
-      const hmacValid = await verifyContent(compiledContent, template.hmacSignature, env.TEMPLATE_HMAC_KEY);
+      const compiled = [template.layers.role, template.layers.objective, template.layers.constraints, template.layers.outputShape].join("\n");
+      const hmacValid = await verifyContent(compiled, template.hmacSignature, env.TEMPLATE_HMAC_KEY);
 
       // Sanitize input
       const { sanitized, verdict, threats } = sanitizeInput(params.userInput);
