@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Authentication & Authorization (B1 boundary)
 - **JWT authentication** with algorithm pinning (HS256 only — `alg: none` and asymmetric algorithms rejected).
 - **RBAC enforcement**: permission claims (`template:read`, `template:write`, `template:delete`, `audit:read`, `hitl:resolve`) checked before each operation.
-- **Identity-keyed rate limiting**: rate limits are keyed on JWT `sub` (not IP address) to prevent evasion via proxy rotation.
+- **Rate limiting at the edge**: burst and sustained rate limits keyed on `CF-Connecting-IP` (rate limiting middleware runs before JWT auth; keys upgrade to JWT `sub` when already set by a preceding middleware).
 - **CORS headers** on all routes.
 
 #### HITL Gate (SPEC KIT A3)

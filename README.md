@@ -104,7 +104,7 @@ npm run deploy
 | Boundary | Threat | Mitigation | Status |
 |----------|--------|------------|--------|
 | B0→B1 | Spoofing | JWT with algorithm pinning (HS256 only) | ✅ |
-| B0→B1 | DoS | Identity-keyed rate limiting (not IP) | ✅ |
+| B0→B1 | DoS | Rate limiting per client IP at edge (before JWT auth; upgrades to JWT `sub` when available) | ✅ |
 | B1→B2 | Privilege escalation | RBAC with permission checks | ✅ |
 | B2 | Direct prompt injection | NFKC + regex + entropy analysis | ✅ |
 | B2 | Indirect injection | Structured separation + sandwich defense | ✅ |
