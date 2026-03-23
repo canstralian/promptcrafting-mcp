@@ -12,6 +12,9 @@ import { secureHeaders } from "hono/secure-headers";
 import { routeAgentRequest } from "agents";
 import type { Env } from "./types.js";
 import { authMiddleware, rateLimitMiddleware, requirePermission } from "./middleware/auth.js";
+import {
+  resolveHITLApproval, getHITLApprovalStatus, listPendingHITLApprovals,
+} from "./services/hitl.js";
 
 // Re-export the Durable Object class (required by Workers runtime)
 export { PromptMCPServer } from "./mcp-agent.js";
@@ -116,6 +119,57 @@ api.get("/audit", requirePermission("audit:read"), async (c) => {
     .all();
 
   return c.json({ logs: result.results ?? [], count: result.results?.length ?? 0 });
+});
+
+// ─── HITL Management REST Endpoints ───────────────────────────────
+// Allows admin dashboards and CI/CD pipelines to manage HITL approvals
+// without requiring an MCP client. Only admins and operators may resolve.
+
+api.get("/hitl", requirePermission("hitl:resolve"), async (c) => {
+  const limit = Math.min(parseInt(c.req.query("limit") ?? "50"), 100);
+  const pending = await listPendingHITLApprovals(c.env.AUDIT_DB, limit);
+  return c.json({ pending, count: pending.length });
+});
+
+api.get("/hitl/:requestId", requirePermission("hitl:resolve"), async (c) => {
+  const requestId = c.req.param("requestId");
+  const status = await getHITLApprovalStatus(c.env.AUDIT_DB, requestId);
+  if (!status) return c.json({ error: "HITL request not found" }, 404);
+  return c.json(status);
+});
+
+api.post("/hitl/:requestId/resolve", requirePermission("hitl:resolve"), async (c) => {
+  const requestId = c.req.param("requestId");
+  const userId = c.get("userId") as string;
+
+  let body: { resolution?: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (body.resolution !== "approved" && body.resolution !== "rejected") {
+    return c.json({ error: "resolution must be 'approved' or 'rejected'" }, 400);
+  }
+
+  const result = await resolveHITLApproval(
+    c.env.AUDIT_DB,
+    requestId,
+    body.resolution,
+    userId
+  );
+
+  if (!result.ok) {
+    return c.json({ error: result.error }, 409);
+  }
+
+  return c.json({
+    requestId,
+    resolution: body.resolution,
+    resolvedBy: userId,
+    resolvedAt: new Date().toISOString(),
+  });
 });
 
 // Mount API routes
