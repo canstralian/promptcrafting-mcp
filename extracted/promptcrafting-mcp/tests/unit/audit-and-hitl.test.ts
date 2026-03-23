@@ -12,6 +12,7 @@ import {
   resolveHITLApproval,
   listPendingHITLApprovals,
   waitForHITLDecision,
+  getHITLApprovalStatus,
 } from "../../src/services/hitl.js";
 
 beforeEach(async () => {
@@ -310,8 +311,50 @@ describe("listPendingHITLApprovals", () => {
     for (const p of pending) {
       expect(p).toHaveProperty("requestId");
       expect(p).toHaveProperty("templateId");
+      expect(p).toHaveProperty("status");
       expect(p).toHaveProperty("expiresAt");
     }
+  });
+
+  it("should filter by status='timed_out' to list expired requests", async () => {
+    const id1 = crypto.randomUUID();
+    const id2 = crypto.randomUUID();
+
+    // Create one pending request
+    await requestHITLApproval(env.AUDIT_DB, {
+      requestId: id1,
+      templateId: "tmpl-pending-filter",
+      templateName: "Pending Filter Template",
+      userId: TEST_USER_ID,
+      variablesHash: "hash-pending",
+      timeoutMs: 60_000,
+    });
+
+    // Create one that will time out immediately
+    await requestHITLApproval(env.AUDIT_DB, {
+      requestId: id2,
+      templateId: "tmpl-timeout-filter",
+      templateName: "Timeout Filter Template",
+      userId: TEST_USER_ID,
+      variablesHash: "hash-timeout",
+      timeoutMs: 1,
+    });
+
+    // Let it timeout
+    await waitForHITLDecision(env.AUDIT_DB, id2, 1);
+
+    // List only timed_out
+    const timedOut = await listPendingHITLApprovals(env.AUDIT_DB, 50, "timed_out");
+    const timedOutIds = timedOut.map((p) => p.requestId);
+    expect(timedOutIds).toContain(id2);
+    expect(timedOutIds).not.toContain(id1);
+    expect(timedOut.every((p) => p.status === "timed_out")).toBe(true);
+
+    // List only pending
+    const pending = await listPendingHITLApprovals(env.AUDIT_DB, 50, "pending");
+    const pendingIds = pending.map((p) => p.requestId);
+    expect(pendingIds).toContain(id1);
+    expect(pendingIds).not.toContain(id2);
   });
 });
 
@@ -347,6 +390,38 @@ describe("resolveHITLApproval — edge cases", () => {
     const result = await resolveHITLApproval(env.AUDIT_DB, id, "approved", "late-approver");
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/terminal state/i);
+  });
+
+  it("should return HITL_EXPIRED error when trying to resolve an expired pending request", async () => {
+    const id = crypto.randomUUID();
+    // Create approval with 1ms timeout (will expire immediately)
+    await requestHITLApproval(env.AUDIT_DB, {
+      requestId: id,
+      templateId: "tmpl-expired",
+      templateName: "Expired Template",
+      userId: TEST_USER_ID,
+      variablesHash: "hash-expired",
+      timeoutMs: 1,
+    });
+
+    // Wait a bit to ensure expiry
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    // Try to resolve it — should fail with HITL_EXPIRED as window closed
+    const result = await resolveHITLApproval(env.AUDIT_DB, id, "approved", "late-approver");
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/HITL_EXPIRED/);
+    expect(result.error).toMatch(/Approval window closed/);
+
+    // Verify it was marked as timed_out
+    const status = await getHITLApprovalStatus(env.AUDIT_DB, id);
+    expect(status?.status).toBe("timed_out");
+
+    // Verify dead-letter record was created
+    const deadLetterRecord = await env.AUDIT_DB.prepare(
+      "SELECT * FROM hitl_dead_letter WHERE request_id = ?"
+    ).bind(id).first();
+    expect(deadLetterRecord).not.toBeNull();
   });
 });
 
