@@ -10,8 +10,9 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { secureHeaders } from "hono/secure-headers";
 import { routeAgentRequest } from "agents";
-import type { Env } from "./types.js";
+import type { Env, PromptTemplate } from "./types.js";
 import { authMiddleware, rateLimitMiddleware, requirePermission } from "./middleware/auth.js";
+import { writeTemplateChange } from "./services/audit.js";
 
 // Re-export the Durable Object class (required by Workers runtime)
 export { PromptMCPServer } from "./mcp-agent.js";
@@ -85,8 +86,25 @@ api.get("/templates/:id", requirePermission("template:read"), async (c) => {
 
 api.delete("/templates/:id", requirePermission("template:delete"), async (c) => {
   const id = c.req.param("id");
+  const userId = c.get("userId") as string;
+
+  // Read before delete to capture content hash for audit
+  const existing = await c.env.PROMPT_TEMPLATES.get(`template:${id}`, "json") as PromptTemplate | null;
+  if (!existing) return c.json({ error: "Template not found" }, 404);
+
   await c.env.PROMPT_TEMPLATES.delete(`template:${id}`);
-  return c.json({ deleted: true, id, note: "Versioned copies retained for audit" });
+
+  // Audit: template deletion must be logged (STRIDE-R at B3)
+  await writeTemplateChange(c.env.AUDIT_DB, {
+    templateId: id,
+    action: "delete",
+    userId,
+    version: existing.version,
+    contentHash: existing.contentHash,
+    hmacValid: false, // not re-verifying on delete path
+  });
+
+  return c.json({ deleted: true, id, note: "Versioned copies retained for audit (90-day TTL)" });
 });
 
 // Audit logs
