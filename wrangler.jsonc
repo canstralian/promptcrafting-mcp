@@ -87,7 +87,11 @@
   //                       Used by prompt-builder.ts signContent() and verifyContent().
   //
   //   OPENAI_API_KEY    — (optional) if using external OpenAI-compatible model providers
-  //                       instead of Workers AI.
+  //                       instead of Workers AI. Not currently implemented.
+  //                       ⚠️ If external providers are added: TLS certificate pinning is
+  //                       REQUIRED per docs/security/tls-policy.md. Current architecture
+  //                       uses only Cloudflare native bindings (Workers AI, D1, KV) which
+  //                       are secured by Cloudflare's internal TLS infrastructure.
   //
   // Non-secret vars:
   "vars": {

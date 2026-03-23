@@ -98,8 +98,9 @@ npm run deploy
 | B4→B2 | PII leakage | Regex PII detection + redaction | ✅ |
 | B4→B2 | Prompt leakage | System instruction pattern detection | ✅ |
 | B1 | JWT confusion | Algorithm pinning, claim validation | ✅ |
-| B2 | HITL timeout/DoS | Configurable timeout (planned) | 🔲 |
-| B4 | Response integrity | TLS cert pinning (planned) | 🔲 |
+| B2 | HITL timeout/DoS | Configurable timeout + dead-letter queue | ✅ |
+| B0→B1 | TLS downgrade | Cloudflare edge TLS 1.2+ enforcement | ✅ |
+| B2→B4 | External provider MITM | TLS cert pinning (deferred: no external calls) | ⏸️ |
 
 ## Endpoints
 
@@ -152,11 +153,15 @@ promptcrafting-mcp/
         └── prompt-tools.ts   # MCP tool registrations
 ```
 
+## Security Documentation
+
+- [TLS Certificate Pinning Policy](docs/security/tls-policy.md) — Comprehensive TLS security posture, certificate validation, and Cloudflare Firewall for AI evaluation
+
 ## Next Steps
 
 - [ ] STRIDE threat model diagram per boundary
-- [ ] HITL gate with configurable timeout + dead-letter path
-- [ ] TLS certificate pinning for external model providers
+- [x] HITL gate with configurable timeout + dead-letter path
+- [x] TLS certificate pinning policy documentation (no external calls = no pinning needed)
 - [ ] Integration tests with MCP Inspector
 - [ ] Prompt A/B testing via KV version routing
-- [ ] Cloudflare Firewall for AI integration (semantic input/output scanning)
+- [ ] Cloudflare Firewall for AI integration (adopt when Enterprise plan is active)
