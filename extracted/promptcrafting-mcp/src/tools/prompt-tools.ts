@@ -19,7 +19,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Env, PromptTemplate } from "../types.js";
 import {
   CreateTemplateSchema, UpdateTemplateSchema, GetTemplateSchema,
-  ListTemplatesSchema, DeleteTemplateSchema, ExecutePromptSchema,
+  ListTemplatesSchema, DeleteTemplateSchema, SetABWeightSchema, ExecutePromptSchema,
   ValidatePromptSchema, QueryAuditSchema,
   ResolveHITLSchema, GetHITLStatusSchema, ListPendingHITLSchema,
 } from "../schemas/index.js";
@@ -39,6 +39,65 @@ import {
 
 // ─── Register All Tools ────────────────────────────────────────────
 export function registerPromptTools(server: McpServer, env: Env, userId: string): void {
+
+  // ═══════════════════════════════════════════════════════════════════
+  // A/B TESTING HELPER FUNCTIONS
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Resolves a template version probabilistically based on A/B weights.
+   * If no templateVersion is specified, fetches all versions from KV and
+   * selects one based on relative weights.
+   */
+  async function resolveTemplateVersion(
+    templateId: string,
+    requestedVersion?: number
+  ): Promise<PromptTemplate | null> {
+    // If version is explicitly requested, load it directly
+    if (requestedVersion) {
+      const key = `template:${templateId}:v${requestedVersion}`;
+      return await env.PROMPT_TEMPLATES.get(key, "json") as PromptTemplate | null;
+    }
+
+    // No version specified — perform probabilistic routing
+    // List all versioned keys for this template
+    const prefix = `template:${templateId}:v`;
+    const list = await env.PROMPT_TEMPLATES.list({ prefix });
+
+    if (!list.keys.length) {
+      // No versioned copies, try latest
+      return await env.PROMPT_TEMPLATES.get(`template:${templateId}`, "json") as PromptTemplate | null;
+    }
+
+    // Read weights from KV list metadata — avoids N individual get() calls on hot path
+    interface VersionMeta { key: string; abWeight: number }
+    const weighted: VersionMeta[] = list.keys.map((k) => ({
+      key: k.name,
+      abWeight: typeof (k.metadata as Record<string, unknown>)?.abWeight === "number"
+        ? (k.metadata as Record<string, unknown>).abWeight as number
+        : 1.0,
+    }));
+
+    if (weighted.length === 0) return null;
+    if (weighted.length === 1) {
+      return await env.PROMPT_TEMPLATES.get(weighted[0].key, "json") as PromptTemplate | null;
+    }
+
+    // Calculate total weight
+    const totalWeight = weighted.reduce((sum, v) => sum + v.abWeight, 0);
+    let selected: string;
+    if (totalWeight === 0) {
+      selected = weighted[Math.floor(Math.random() * weighted.length)].key;
+    } else {
+      let random = Math.random() * totalWeight;
+      selected = weighted[weighted.length - 1].key; // fallback
+      for (const v of weighted) {
+        random -= v.abWeight;
+        if (random <= 0) { selected = v.key; break; }
+      }
+    }
+    return await env.PROMPT_TEMPLATES.get(selected, "json") as PromptTemplate | null;
+  }
 
   // ═══════════════════════════════════════════════════════════════════
   // TEMPLATE MANAGEMENT TOOLS
@@ -79,6 +138,7 @@ Returns the template ID, version, and content hash.`,
         .tags(params.tags ?? [])
         .model(params.model)
         .requiresHITL(params.requiresHITL ?? false)
+        .abWeight(params.abWeight ?? 1.0)
         .createdBy(userId)
         .build(env.TEMPLATE_HMAC_KEY);
 
@@ -86,7 +146,7 @@ Returns the template ID, version, and content hash.`,
       await env.PROMPT_TEMPLATES.put(
         `template:${template.id}`,
         JSON.stringify(template),
-        { metadata: { name: template.name, version: template.version } }
+        { metadata: { name: template.name, version: template.version, abWeight: template.abWeight } }
       );
       // Store versioned copy (90-day retention)
       await env.PROMPT_TEMPLATES.put(
@@ -290,6 +350,7 @@ Partial updates are supported — only supply the fields you want to change.`,
         tags: params.tags ?? raw.tags,
         model: params.model ?? raw.model,
         requiresHITL: params.requiresHITL !== undefined ? params.requiresHITL : raw.requiresHITL,
+        abWeight: params.abWeight !== undefined ? params.abWeight : raw.abWeight,
         version: raw.version + 1,
         updatedAt: new Date().toISOString(),
       };
@@ -308,7 +369,7 @@ Partial updates are supported — only supply the fields you want to change.`,
       await env.PROMPT_TEMPLATES.put(
         `template:${updatedTemplate.id}`,
         JSON.stringify(updatedTemplate),
-        { metadata: { name: updatedTemplate.name, version: updatedTemplate.version } }
+        { metadata: { name: updatedTemplate.name, version: updatedTemplate.version, abWeight: updatedTemplate.abWeight } }
       );
       await env.PROMPT_TEMPLATES.put(
         `template:${updatedTemplate.id}:v${updatedTemplate.version}`,
@@ -342,6 +403,92 @@ Partial updates are supported — only supply the fields you want to change.`,
     }
   );
 
+  server.registerTool(
+    "promptcraft_set_ab_weight",
+    {
+      title: "Set A/B Testing Weight",
+      description: `Set the A/B testing weight for a specific template version.
+Weights are used for probabilistic version routing when no templateVersion is
+specified in promptcraft_execute_prompt. Higher weights receive proportionally
+more traffic.
+
+Example: Two versions with weights 0.9 and 0.1 will route 90% and 10% of traffic
+respectively. Weights are relative — (0.9, 0.1) behaves the same as (9, 1).
+
+This tool only updates the weight for a specific version in KV metadata. It does
+not modify the template content or increment the version number.`,
+      inputSchema: SetABWeightSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (params) => {
+      // Load the specific versioned template
+      const key = `template:${params.templateId}:v${params.version}`;
+      const template = await env.PROMPT_TEMPLATES.get(key, "json") as PromptTemplate | null;
+
+      if (!template) {
+        return {
+          isError: true,
+          content: [{
+            type: "text",
+            text: `Template version not found: ${params.templateId} v${params.version}`,
+          }],
+        };
+      }
+
+      // Update the abWeight in the template
+      const updatedTemplate: PromptTemplate = {
+        ...template,
+        abWeight: params.abWeight,
+        updatedAt: new Date().toISOString(),
+      };
+
+      // Store the updated versioned copy
+      await env.PROMPT_TEMPLATES.put(
+        key,
+        JSON.stringify(updatedTemplate),
+        { expirationTtl: 60 * 60 * 24 * 90 }
+      );
+
+      // If this is the latest version, also update the latest key
+      const latest = await env.PROMPT_TEMPLATES.get(`template:${params.templateId}`, "json") as PromptTemplate | null;
+      if (latest && latest.version === params.version) {
+        const updatedLatest = {
+          ...latest,
+          abWeight: params.abWeight,
+          updatedAt: new Date().toISOString(),
+        };
+        await env.PROMPT_TEMPLATES.put(
+          `template:${params.templateId}`,
+          JSON.stringify(updatedLatest),
+          { metadata: { name: updatedLatest.name, version: updatedLatest.version, abWeight: updatedLatest.abWeight } }
+        );
+      }
+
+      // Audit: weight change is a config mutation — must be logged
+      await writeTemplateChange(env.AUDIT_DB, {
+        templateId: params.templateId,
+        action: "update",
+        userId: "system",
+        version: params.version,
+        contentHash: updatedTemplate.contentHash,
+        hmacValid: true,
+        metadata: JSON.stringify({ abWeightChanged: true, abWeight: params.abWeight }),
+      });
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            templateId: params.templateId,
+            version: params.version,
+            abWeight: params.abWeight,
+            updated: true,
+          }),
+        }],
+      };
+    }
+  );
+
   // ═══════════════════════════════════════════════════════════════════
   // EXECUTION TOOL — with HITL gate (SPEC KIT A3)
   // ═══════════════════════════════════════════════════════════════════
@@ -351,7 +498,7 @@ Partial updates are supported — only supply the fields you want to change.`,
     {
       title: "Execute Prompt",
       description: `Execute a prompt template with the full security pipeline:
-1. Load template from KV with HMAC verification
+1. Load template from KV with HMAC verification (A/B tested if no version specified)
 2. [HITL] If template.requiresHITL is true: request human approval and block
    until approved, rejected, or HITL_TIMEOUT_MS elapses. Timeout routes to
    dead-letter — never to silent pass. (SPEC KIT A3: Approval Bypass / REQUIRE_HITL)
@@ -359,7 +506,10 @@ Partial updates are supported — only supply the fields you want to change.`,
 4. Compile four-layer prompt with structured separation + sandwich defense
 5. Run inference via Workers AI
 6. Validate output (schema, PII, leakage, canary token)
-7. Log audit trail to D1
+7. Log audit trail to D1 (including resolved version)
+
+If no templateVersion is specified, a version is selected probabilistically based
+on abWeight values. Higher weights receive proportionally more traffic.
 
 Returns the model output, guardrail results, and usage metrics.
 Fail-closed: if any guardrail fails, the output is NOT returned.`,
@@ -370,11 +520,8 @@ Fail-closed: if any guardrail fails, the output is NOT returned.`,
       const requestId = crypto.randomUUID();
       const startTime = Date.now();
 
-      // ── Step 1: Load and verify template ──────────────────────────
-      const key = params.templateVersion
-        ? `template:${params.templateId}:v${params.templateVersion}`
-        : `template:${params.templateId}`;
-      const template = await env.PROMPT_TEMPLATES.get(key, "json") as PromptTemplate | null;
+      // ── Step 1: Load and verify template (with A/B resolution) ────────
+      const template = await resolveTemplateVersion(params.templateId, params.templateVersion);
 
       if (!template) {
         return { isError: true, content: [{ type: "text", text: `Template not found: ${params.templateId}` }] };

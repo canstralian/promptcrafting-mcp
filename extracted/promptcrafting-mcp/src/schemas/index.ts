@@ -37,6 +37,9 @@ export const CreateTemplateSchema = z.object({
   // HITL gate — SPEC KIT A3: Approval Bypass / REQUIRE_HITL
   requiresHITL: z.boolean().default(false)
     .describe("When true, every execution blocks until a human approves (admin/operator). Timeout routes to dead-letter, never silent pass."),
+  // A/B Testing Weight (0.0–1.0, default 1.0)
+  abWeight: z.number().min(0).default(1.0)  // relative weight, no upper bound
+    .describe("A/B testing weight for probabilistic version routing (0.0–1.0). Higher weights receive proportionally more traffic when no templateVersion is specified."),
 }).strict();
 
 export const UpdateTemplateSchema = z.object({
@@ -50,6 +53,8 @@ export const UpdateTemplateSchema = z.object({
   model: z.string().max(100).optional(),
   requiresHITL: z.boolean().optional()
     .describe("Enable or disable HITL gate on this template"),
+  abWeight: z.number().min(0).optional()  // relative weight, no upper bound
+    .describe("Update A/B testing weight (0.0–1.0)"),
 }).strict();
 
 export const GetTemplateSchema = z.object({
@@ -68,6 +73,14 @@ export const ListTemplatesSchema = z.object({
 
 export const DeleteTemplateSchema = z.object({
   templateId: z.string().uuid("Invalid template ID format"),
+}).strict();
+
+export const SetABWeightSchema = z.object({
+  templateId: z.string().uuid("Invalid template ID format"),
+  version: z.number().int().positive()
+    .describe("Version number to set the A/B weight for"),
+  abWeight: z.number().min(0)  // relative weight, no upper bound
+    .describe("A/B testing weight (0.0–1.0). Weights are relative across all versions of the same template."),
 }).strict();
 
 // ─── Prompt Execution Schemas ──────────────────────────────────────
@@ -153,6 +166,7 @@ export type UpdateTemplateInput = z.infer<typeof UpdateTemplateSchema>;
 export type GetTemplateInput = z.infer<typeof GetTemplateSchema>;
 export type ListTemplatesInput = z.infer<typeof ListTemplatesSchema>;
 export type DeleteTemplateInput = z.infer<typeof DeleteTemplateSchema>;
+export type SetABWeightInput = z.infer<typeof SetABWeightSchema>;
 export type ExecutePromptInput = z.infer<typeof ExecutePromptSchema>;
 export type ValidatePromptInput = z.infer<typeof ValidatePromptSchema>;
 export type ResolveHITLInput = z.infer<typeof ResolveHITLSchema>;
