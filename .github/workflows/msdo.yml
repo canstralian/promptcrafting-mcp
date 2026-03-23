@@ -1,0 +1,64 @@
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+#
+# Microsoft Security DevOps (MSDO) is a command line application which integrates static analysis tools into the development cycle.
+# MSDO installs, configures and runs the latest versions of static analysis tools
+# (including, but not limited to, SDL/security and compliance tools).
+#
+# The Microsoft Security DevOps action supports multiple platforms including ubuntu-latest.
+#
+# For more information about the action, check out https://github.com/microsoft/security-devops-action
+#
+# Please note this workflow does not integrate your GitHub Org with Microsoft Defender For DevOps. You have to create an integration
+# and provide permission before this can report data back to Azure.
+# Read the official documentation here: https://learn.microsoft.com/en-us/azure/defender-for-cloud/quickstart-onboard-github
+
+name: "Microsoft Defender For Devops"
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '29 12 * * 6'
+
+jobs:
+  MSDO:
+    # MSDO supports both windows-latest and ubuntu-latest
+    # Using ubuntu-latest for TypeScript/Node.js projects
+    runs-on: ubuntu-latest
+
+    permissions:
+      # Required for uploading SARIF results to GitHub Security tab
+      security-events: write
+      # Required for checking out the repository
+      contents: read
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Run Microsoft Security DevOps
+      uses: microsoft/security-devops-action@v1.6.0
+      id: msdo
+      with:
+        # MSDO will automatically detect and run appropriate tools for TypeScript/JavaScript
+        # including ESLint security rules, template analyzer, and other static analysis tools
+        categories: 'code,secrets,dependencies'
+
+    - name: Upload results to Security tab
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ steps.msdo.outputs.sarifFile }}
