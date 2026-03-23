@@ -72,20 +72,20 @@ export function registerPromptTools(server: McpServer, env: Env, userId: string)
     // Fetch all versions to get their weights
     const versions: PromptTemplate[] = [];
     for (const k of list.keys) {
-      const template = await env.PROMPT_TEMPLATES.get(k.name, "json") as PromptTemplate | null;
+      const template = await env.PROMPT_TEMPLATES.get(k.name, "json") as PromptTemplate | null | undefined;
       if (template) {
         versions.push(template);
       }
     }
 
     if (versions.length === 0) return null;
-    if (versions.length === 1) return versions[0];
+    if (versions.length === 1) return versions[0] ?? null;
 
     // Calculate total weight
     const totalWeight = versions.reduce((sum, t) => sum + t.abWeight, 0);
     if (totalWeight === 0) {
       // All weights are 0, return random version
-      return versions[Math.floor(Math.random() * versions.length)];
+      return versions[Math.floor(Math.random() * versions.length)] ?? null;
     }
 
     // Weighted random selection
@@ -98,7 +98,7 @@ export function registerPromptTools(server: McpServer, env: Env, userId: string)
     }
 
     // Fallback (shouldn't reach here)
-    return versions[versions.length - 1];
+    return versions[versions.length - 1] ?? null;
   }
 
   // ═══════════════════════════════════════════════════════════════════
