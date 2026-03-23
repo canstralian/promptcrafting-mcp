@@ -98,7 +98,7 @@ npm run deploy
 | B4→B2 | PII leakage | Regex PII detection + redaction | ✅ |
 | B4→B2 | Prompt leakage | System instruction pattern detection | ✅ |
 | B1 | JWT confusion | Algorithm pinning, claim validation | ✅ |
-| B2 | HITL timeout/DoS | Configurable timeout (planned) | 🔲 |
+| B2 | HITL timeout/DoS | Configurable timeout (`HITL_TIMEOUT_MS`), dead-letter on expiry | ✅ |
 | B4 | Response integrity | TLS cert pinning (planned) | 🔲 |
 
 ## Endpoints
@@ -111,6 +111,9 @@ npm run deploy
 | `/api/v1/templates/:id` | GET | JWT + `template:read` | Get template |
 | `/api/v1/templates/:id` | DELETE | JWT + `template:delete` | Delete template |
 | `/api/v1/audit` | GET | JWT + `audit:read` | Query audit logs |
+| `/api/v1/hitl` | GET | JWT + `hitl:resolve` | List pending HITL approvals |
+| `/api/v1/hitl/:requestId` | GET | JWT + `hitl:resolve` | Get HITL approval status |
+| `/api/v1/hitl/:requestId/resolve` | POST | JWT + `hitl:resolve` | Approve or reject HITL request |
 
 ## MCP Tools
 
@@ -155,7 +158,7 @@ promptcrafting-mcp/
 ## Next Steps
 
 - [ ] STRIDE threat model diagram per boundary
-- [ ] HITL gate with configurable timeout + dead-letter path
+- [x] HITL gate with configurable timeout + dead-letter path
 - [ ] TLS certificate pinning for external model providers
 - [ ] Integration tests with MCP Inspector
 - [ ] Prompt A/B testing via KV version routing
