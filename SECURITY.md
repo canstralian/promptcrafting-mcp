@@ -34,8 +34,8 @@ When submitting a report, include as much of the following as possible:
 
 After you submit a report:
 
-- We will acknowledge receipt within **[3 business days]**
-- We will provide an initial triage update within **[7 business days]**
+- We will acknowledge receipt within **3 business days**.
+- We will provide an initial triage update within **7 business days**.
 - We may contact you for additional details or validation
 - We will let you know whether the report is accepted, needs more information, or is out of scope
 
