@@ -135,6 +135,7 @@ export async function waitForHITLDecision(
 // ─── Resolve HITL Approval ─────────────────────────────────────────
 // Called by the approval endpoint. Only admins/operators may call this.
 // Rejects if the request has already reached a terminal state.
+// Rejects if the request has expired (HITL_EXPIRED error).
 export async function resolveHITLApproval(
   db: D1Database,
   requestId: string,
@@ -142,9 +143,9 @@ export async function resolveHITLApproval(
   resolvedBy: string
 ): Promise<{ ok: boolean; error?: string }> {
   const row = await db
-    .prepare(`SELECT status FROM hitl_approvals WHERE request_id = ?`)
+    .prepare(`SELECT status, expires_at FROM hitl_approvals WHERE request_id = ?`)
     .bind(requestId)
-    .first<{ status: HITLStatus }>();
+    .first<{ status: HITLStatus; expires_at: string }>();
 
   if (!row) {
     return { ok: false, error: `HITL request not found: ${requestId}` };
@@ -154,6 +155,18 @@ export async function resolveHITLApproval(
     return {
       ok: false,
       error: `Cannot resolve — request is already in terminal state: ${row.status}`,
+    };
+  }
+
+  // Check if the approval window has expired
+  const expiresAt = new Date(row.expires_at).getTime();
+  const now = Date.now();
+  if (now >= expiresAt) {
+    // Mark as timed out if not already marked
+    await markTimedOut(db, requestId);
+    return {
+      ok: false,
+      error: `HITL_EXPIRED: Approval window closed at ${row.expires_at}`,
     };
   }
 
@@ -210,30 +223,56 @@ export async function getHITLApprovalStatus(
 
 // ─── List Pending HITL Approvals ───────────────────────────────────
 // Used by admin/operator dashboards to surface outstanding approval requests.
+// Can optionally filter by status (default: 'pending', but can also query 'timed_out').
 export async function listPendingHITLApprovals(
   db: D1Database,
-  limit = 50
+  limit = 50,
+  status: HITLStatus | "all" = "pending"
 ): Promise<Array<{
   requestId: string;
   templateId: string;
   userId: string;
+  status: HITLStatus;
   expiresAt: string;
   context: Record<string, unknown> | null;
   createdAt: string;
 }>> {
-  const result = await db
-    .prepare(
-      `SELECT request_id, template_id, user_id, expires_at, context, created_at
+  let query: string;
+  let bindings: (number | string)[] = [];
+
+  if (status === "all") {
+    // Return all HITL requests, regardless of status
+    query = `SELECT request_id, template_id, user_id, status, expires_at, context, created_at
+       FROM hitl_approvals
+       ORDER BY created_at DESC
+       LIMIT ?`;
+    bindings = [limit];
+  } else if (status === "pending") {
+    // Original behavior: only pending requests that haven't expired yet
+    query = `SELECT request_id, template_id, user_id, status, expires_at, context, created_at
        FROM hitl_approvals
        WHERE status = 'pending' AND expires_at > datetime('now')
        ORDER BY created_at ASC
-       LIMIT ?`
-    )
-    .bind(limit)
+       LIMIT ?`;
+    bindings = [limit];
+  } else {
+    // Filter by specific status (e.g., 'timed_out', 'approved', 'rejected')
+    query = `SELECT request_id, template_id, user_id, status, expires_at, context, created_at
+       FROM hitl_approvals
+       WHERE status = ?
+       ORDER BY created_at DESC
+       LIMIT ?`;
+    bindings = [status, limit];
+  }
+
+  const result = await db
+    .prepare(query)
+    .bind(...bindings)
     .all<{
       request_id: string;
       template_id: string;
       user_id: string;
+      status: HITLStatus;
       expires_at: string;
       context: string | null;
       created_at: string;
@@ -243,6 +282,7 @@ export async function listPendingHITLApprovals(
     requestId: r.request_id,
     templateId: r.template_id,
     userId: r.user_id,
+    status: r.status,
     expiresAt: r.expires_at,
     context: r.context ? JSON.parse(r.context) : null,
     createdAt: r.created_at,

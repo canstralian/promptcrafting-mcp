@@ -115,6 +115,8 @@ export const GetHITLStatusSchema = z.object({
 export const ListPendingHITLSchema = z.object({
   limit: z.number().int().min(1).max(100).default(50)
     .describe("Maximum number of pending approvals to return"),
+  status: z.enum(["pending", "approved", "rejected", "timed_out", "all"]).default("pending")
+    .describe("Filter by status: 'pending' (default), 'timed_out', 'approved', 'rejected', or 'all'"),
 }).strict();
 
 // ─── Audit Query Schemas ───────────────────────────────────────────
