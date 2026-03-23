@@ -9,24 +9,33 @@
 //           writes to template_changes audit table, fails gracefully if template not found
 //   - [FIX] All tools now import writeTemplateChange from audit service
 //   - [NOTE] onToolCall (McpAgent) must be invoked explicitly — see mcp-agent.ts
+//   - [HITL] promptcraft_execute_prompt: blocks on requiresHITL templates until
+//           approved, rejected, or timed out. Timeout → dead-letter. Never silent pass.
+//           SPEC KIT: A3 Approval Bypass / REQUIRE_HITL (agent-core-v1.0)
+//   - [HITL] Added promptcraft_resolve_hitl, promptcraft_get_hitl_status,
+//           promptcraft_list_pending_hitl tools
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
 import type { Env, PromptTemplate } from "../types.js";
 import {
   CreateTemplateSchema, UpdateTemplateSchema, GetTemplateSchema,
   ListTemplatesSchema, DeleteTemplateSchema, ExecutePromptSchema,
   ValidatePromptSchema, QueryAuditSchema,
+  ResolveHITLSchema, GetHITLStatusSchema, ListPendingHITLSchema,
 } from "../schemas/index.js";
 import {
   PromptTemplateBuilder, compilePrompt, verifyContent,
   hashContent, signContent,
 } from "../services/prompt-builder.js";
 import { sanitizeInput } from "../guardrails/input-sanitizer.js";
-import { validateOutput, checkCanaryToken } from "../guardrails/output-validator.js";
+import { validateOutput } from "../guardrails/output-validator.js";
 import {
   writeAuditLog, writeGuardrailEvent, writeTemplateChange, queryAuditLogs,
 } from "../services/audit.js";
+import {
+  requestHITLApproval, waitForHITLDecision, resolveHITLApproval,
+  getHITLApprovalStatus, listPendingHITLApprovals,
+} from "../services/hitl.js";
 
 // ─── Register All Tools ────────────────────────────────────────────
 export function registerPromptTools(server: McpServer, env: Env, userId: string): void {
@@ -47,6 +56,7 @@ Layers:
   - constraints: Boundaries, forbidden actions, rules
   - outputShape: Expected format, schema, examples
 
+Set requiresHITL: true to require human approval before every execution.
 The template is signed with HMAC-SHA256 to prevent tampering in storage.
 Returns the template ID, version, and content hash.`,
       inputSchema: CreateTemplateSchema,
@@ -68,6 +78,7 @@ Returns the template ID, version, and content hash.`,
         .outputShape(params.outputShape ?? "Respond in well-structured plain text.")
         .tags(params.tags ?? [])
         .model(params.model)
+        .requiresHITL(params.requiresHITL ?? false)
         .createdBy(userId)
         .build(env.TEMPLATE_HMAC_KEY);
 
@@ -91,7 +102,7 @@ Returns the template ID, version, and content hash.`,
         userId,
         version: template.version,
         contentHash: template.contentHash,
-        hmacValid: true, // We just signed it — by definition valid
+        hmacValid: true,
       });
 
       return {
@@ -102,6 +113,7 @@ Returns the template ID, version, and content hash.`,
             name: template.name,
             version: template.version,
             contentHash: template.contentHash,
+            requiresHITL: template.requiresHITL,
             created: true,
           }),
         }],
@@ -195,10 +207,6 @@ to prevent silent double-delete from masking replay attacks).`,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
     async (params) => {
-      // [FIX] Read the template BEFORE deleting so we can:
-      //   1. Verify it actually exists (reject silent no-op deletes)
-      //   2. Capture contentHash + version for the audit record
-      //   3. Verify HMAC integrity at time of deletion (forensic value)
       const raw = await env.PROMPT_TEMPLATES.get(`template:${params.templateId}`, "json") as PromptTemplate | null;
 
       if (!raw) {
@@ -208,21 +216,15 @@ to prevent silent double-delete from masking replay attacks).`,
         };
       }
 
-      // Verify HMAC at time of deletion — records whether the template had already
-      // been tampered with before deletion (important forensic data point).
       const compiledContent = [raw.layers.role, raw.layers.objective, raw.layers.constraints, raw.layers.outputShape].join("\n");
       const hmacValid = await verifyContent(compiledContent, raw.hmacSignature, env.TEMPLATE_HMAC_KEY);
 
       if (!hmacValid) {
-        // Log the tampering event but still allow deletion (admin may be cleaning up
-        // a poisoned template). Surface the warning prominently.
         console.error(`[SECURITY] Deleting template ${params.templateId} with FAILED HMAC — content was tampered with before deletion`);
       }
 
-      // Delete primary key from KV
       await env.PROMPT_TEMPLATES.delete(`template:${params.templateId}`);
 
-      // [FIX] Write deletion event to template_changes audit table
       await writeTemplateChange(env.AUDIT_DB, {
         templateId: params.templateId,
         action: "delete",
@@ -247,101 +249,80 @@ to prevent silent double-delete from masking replay attacks).`,
     }
   );
 
-  // ═══════════════════════════════════════════════════════════════════
-
   server.registerTool(
     "promptcraft_update_template",
     {
       title: "Update Prompt Template",
       description: `Update one or more layers of an existing prompt template.
-Only provided fields are changed; omitted fields retain their current values.
-The template version is incremented on every update, the new content is re-signed
-with HMAC-SHA256, and the change is recorded in the template_changes audit table.
-The previous version remains accessible via promptcraft_get_template with a version number.`,
+Increments the version, re-signs with HMAC, and stores both the updated latest
+and a new versioned copy. Previous version is retained in KV for audit compliance.
+Partial updates are supported — only supply the fields you want to change.`,
       inputSchema: UpdateTemplateSchema,
-      annotations: {
-        readOnlyHint: false,
-        destructiveHint: false,
-        idempotentHint: false,
-        openWorldHint: false,
-      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
     async (params) => {
-      // 1. Load existing template
-      const existing = await env.PROMPT_TEMPLATES.get(
-        `template:${params.templateId}`, "json"
-      ) as PromptTemplate | null;
+      const raw = await env.PROMPT_TEMPLATES.get(`template:${params.templateId}`, "json") as PromptTemplate | null;
+      if (!raw) {
+        return { isError: true, content: [{ type: "text", text: `Template not found: ${params.templateId}` }] };
+      }
 
-      if (!existing) {
+      // Verify existing HMAC before mutation
+      const existingContent = [raw.layers.role, raw.layers.objective, raw.layers.constraints, raw.layers.outputShape].join("\n");
+      const existingHmacValid = await verifyContent(existingContent, raw.hmacSignature, env.TEMPLATE_HMAC_KEY);
+      if (!existingHmacValid) {
+        console.error(`[SECURITY] Update attempted on tampered template ${params.templateId}`);
         return {
           isError: true,
-          content: [{ type: "text", text: `Template not found: ${params.templateId}` }],
+          content: [{ type: "text", text: "Template integrity check failed — cannot update a tampered template" }],
         };
       }
 
-      // 2. Verify HMAC integrity before mutating
-      const existingCompiled = [
-        existing.layers.role, existing.layers.objective,
-        existing.layers.constraints, existing.layers.outputShape,
-      ].join("\n");
-      const priorHmacValid = await verifyContent(existingCompiled, existing.hmacSignature, env.TEMPLATE_HMAC_KEY);
-
-      if (!priorHmacValid) {
-        console.error(`[SECURITY] Update rejected: HMAC verification failed for template ${params.templateId} — possible prior tampering`);
-        return {
-          isError: true,
-          content: [{ type: "text", text: "Template integrity check failed — update rejected to prevent propagating tampered content" }],
-        };
-      }
-
-      // 3. Apply partial updates
-      const updatedLayers = {
-        objective:   params.objective   ?? existing.layers.objective,
-        role:        params.role        ?? existing.layers.role,
-        constraints: params.constraints ?? existing.layers.constraints,
-        outputShape: params.outputShape ?? existing.layers.outputShape,
+      // Apply partial updates
+      const updatedTemplate: PromptTemplate = {
+        ...raw,
+        layers: {
+          objective: params.objective ?? raw.layers.objective,
+          role: params.role ?? raw.layers.role,
+          constraints: params.constraints ?? raw.layers.constraints,
+          outputShape: params.outputShape ?? raw.layers.outputShape,
+        },
+        description: params.description ?? raw.description,
+        tags: params.tags ?? raw.tags,
+        model: params.model ?? raw.model,
+        requiresHITL: params.requiresHITL !== undefined ? params.requiresHITL : raw.requiresHITL,
+        version: raw.version + 1,
+        updatedAt: new Date().toISOString(),
       };
 
-      // 4. Re-sign updated content
-      const newCompiled = [
-        updatedLayers.role, updatedLayers.objective,
-        updatedLayers.constraints, updatedLayers.outputShape,
+      // Recompute content hash and HMAC
+      const newContent = [
+        updatedTemplate.layers.role,
+        updatedTemplate.layers.objective,
+        updatedTemplate.layers.constraints,
+        updatedTemplate.layers.outputShape,
       ].join("\n");
-      const newContentHash = await hashContent(newCompiled);
-      const newHmac = await signContent(newCompiled, env.TEMPLATE_HMAC_KEY);
-      const newVersion = existing.version + 1;
+      updatedTemplate.contentHash = await hashContent(newContent);
+      updatedTemplate.hmacSignature = await signContent(newContent, env.TEMPLATE_HMAC_KEY);
 
-      const updated: PromptTemplate = {
-        ...existing,
-        description: params.description ?? existing.description,
-        tags:        params.tags        ?? existing.tags,
-        model:       params.model       ?? existing.model,
-        layers:      updatedLayers,
-        contentHash: newContentHash,
-        hmacSignature: newHmac,
-        version:     newVersion,
-        updatedAt:   new Date().toISOString(),
-      };
-
-      // 5. Persist: overwrite latest + store new versioned snapshot
+      // Store updated template (latest + versioned)
       await env.PROMPT_TEMPLATES.put(
-        `template:${params.templateId}`,
-        JSON.stringify(updated),
-        { metadata: { name: updated.name, version: newVersion } }
+        `template:${updatedTemplate.id}`,
+        JSON.stringify(updatedTemplate),
+        { metadata: { name: updatedTemplate.name, version: updatedTemplate.version } }
       );
       await env.PROMPT_TEMPLATES.put(
-        `template:${params.templateId}:v${newVersion}`,
-        JSON.stringify(updated),
+        `template:${updatedTemplate.id}:v${updatedTemplate.version}`,
+        JSON.stringify(updatedTemplate),
         { expirationTtl: 60 * 60 * 24 * 90 }
       );
 
-      // 6. Audit: record update in template_changes
+      // Audit trail
       await writeTemplateChange(env.AUDIT_DB, {
-        templateId: params.templateId,
+        templateId: updatedTemplate.id,
         action: "update",
         userId,
-        version: newVersion,
-        contentHash: newContentHash,
+        version: updatedTemplate.version,
+        contentHash: updatedTemplate.contentHash,
         hmacValid: true,
       });
 
@@ -349,18 +330,20 @@ The previous version remains accessible via promptcraft_get_template with a vers
         content: [{
           type: "text",
           text: JSON.stringify({
-            id: params.templateId,
-            version: newVersion,
-            contentHash: newContentHash,
+            id: updatedTemplate.id,
+            name: updatedTemplate.name,
+            version: updatedTemplate.version,
+            contentHash: updatedTemplate.contentHash,
+            requiresHITL: updatedTemplate.requiresHITL,
             updated: true,
-            updatedAt: updated.updatedAt,
           }),
         }],
       };
     }
   );
 
-  // PROMPT EXECUTION TOOLS
+  // ═══════════════════════════════════════════════════════════════════
+  // EXECUTION TOOL — with HITL gate (SPEC KIT A3)
   // ═══════════════════════════════════════════════════════════════════
 
   server.registerTool(
@@ -369,11 +352,14 @@ The previous version remains accessible via promptcraft_get_template with a vers
       title: "Execute Prompt",
       description: `Execute a prompt template with the full security pipeline:
 1. Load template from KV with HMAC verification
-2. Sanitize user input (NFKC, injection detection, length)
-3. Compile four-layer prompt with structured separation + sandwich defense
-4. Run inference via Workers AI
-5. Validate output (schema, PII, leakage, canary token)
-6. Log audit trail to D1
+2. [HITL] If template.requiresHITL is true: request human approval and block
+   until approved, rejected, or HITL_TIMEOUT_MS elapses. Timeout routes to
+   dead-letter — never to silent pass. (SPEC KIT A3: Approval Bypass / REQUIRE_HITL)
+3. Sanitize user input (NFKC, injection detection, length)
+4. Compile four-layer prompt with structured separation + sandwich defense
+5. Run inference via Workers AI
+6. Validate output (schema, PII, leakage, canary token)
+7. Log audit trail to D1
 
 Returns the model output, guardrail results, and usage metrics.
 Fail-closed: if any guardrail fails, the output is NOT returned.`,
@@ -384,7 +370,7 @@ Fail-closed: if any guardrail fails, the output is NOT returned.`,
       const requestId = crypto.randomUUID();
       const startTime = Date.now();
 
-      // 1. Load and verify template
+      // ── Step 1: Load and verify template ──────────────────────────
       const key = params.templateVersion
         ? `template:${params.templateId}:v${params.templateVersion}`
         : `template:${params.templateId}`;
@@ -408,7 +394,58 @@ Fail-closed: if any guardrail fails, the output is NOT returned.`,
         return { isError: true, content: [{ type: "text", text: "Template integrity check failed" }] };
       }
 
-      // 2. Sanitize user input
+      // ── Step 2: HITL gate (SPEC KIT A3: Approval Bypass / REQUIRE_HITL) ──
+      // INVARIANT: if requiresHITL is true and decision is not 'approved',
+      // execution MUST NOT proceed. This check is unconditional — there is no
+      // bypass path, no default-allow fallback, no exception for timeouts.
+      if (template.requiresHITL) {
+        const timeoutMs = parseInt(env.HITL_TIMEOUT_MS || "300000", 10);
+
+        // Hash variables so we audit context without exposing values
+        const variablesHash = await hashContent(JSON.stringify(params.variables));
+
+        // Write pending approval record
+        await requestHITLApproval(env.AUDIT_DB, {
+          requestId,
+          templateId: template.id,
+          templateName: template.name,
+          userId,
+          variablesHash,
+          timeoutMs,
+        });
+
+        console.log(`[HITL] Approval requested for ${requestId} (template: ${template.name}, timeout: ${timeoutMs}ms)`);
+
+        // Block until approved, rejected, or timed out
+        const decision = await waitForHITLDecision(env.AUDIT_DB, requestId, timeoutMs);
+
+        if (!decision.approved) {
+          const status = decision.reason === "timed_out" ? "hitl_timeout" : "hitl_rejected";
+
+          await writeAuditLog(env.AUDIT_DB, {
+            requestId, sessionId: null, templateId: params.templateId,
+            templateVersion: template.version, userId, model: params.model ?? "none",
+            status, latencyMs: Date.now() - startTime,
+            inputTokens: 0, outputTokens: 0,
+            guardrailFlags: JSON.stringify({
+              hitlGate: true,
+              decision: decision.reason,
+              resolvedBy: decision.resolvedBy ?? null,
+            }),
+            createdAt: new Date().toISOString(),
+          });
+
+          const message = decision.reason === "timed_out"
+            ? `Execution blocked: HITL approval timed out after ${timeoutMs}ms. Request ${requestId} routed to dead-letter queue.`
+            : `Execution blocked: HITL approval rejected by ${decision.resolvedBy ?? "reviewer"}.`;
+
+          return { isError: true, content: [{ type: "text", text: message }] };
+        }
+
+        console.log(`[HITL] Approved for ${requestId} by ${decision.resolvedBy}`);
+      }
+
+      // ── Step 3: Sanitize user input ───────────────────────────────
       if (params.userInput) {
         const { verdict, threats } = sanitizeInput(params.userInput, {
           maxLength: parseInt(env.MAX_PROMPT_LENGTH || "50000"),
@@ -426,14 +463,14 @@ Fail-closed: if any guardrail fails, the output is NOT returned.`,
         }
       }
 
-      // 3. Compile prompt
+      // ── Step 4: Compile prompt ────────────────────────────────────
       const { systemPrompt, userPrompt, canaryToken } = compilePrompt(template, {
         userInput: params.userInput,
         variables: params.variables,
         sandwichDefense: params.sandwichDefense,
       });
 
-      // 4. Run inference
+      // ── Step 5: Run inference ─────────────────────────────────────
       const model = params.model || template.model || "@cf/meta/llama-4-scout-17b-16e-instruct";
       let rawOutput: string;
       try {
@@ -460,7 +497,7 @@ Fail-closed: if any guardrail fails, the output is NOT returned.`,
         return { isError: true, content: [{ type: "text", text: `Inference failed: ${errMsg}` }] };
       }
 
-      // 5. Validate output
+      // ── Step 6: Validate output ───────────────────────────────────
       const outputValidation = validateOutput(rawOutput, {
         canaryToken,
         redactPII: true,
@@ -478,7 +515,7 @@ Fail-closed: if any guardrail fails, the output is NOT returned.`,
         return { isError: true, content: [{ type: "text", text: "Output blocked by security guardrails" }] };
       }
 
-      // 6. Audit log (success path)
+      // ── Step 7: Audit log (success path) ─────────────────────────
       const latencyMs = Date.now() - startTime;
       await writeAuditLog(env.AUDIT_DB, {
         requestId, sessionId: null, templateId: params.templateId,
@@ -505,6 +542,109 @@ Fail-closed: if any guardrail fails, the output is NOT returned.`,
   );
 
   // ═══════════════════════════════════════════════════════════════════
+  // HITL MANAGEMENT TOOLS
+  // SPEC KIT: A3 Approval Bypass / REQUIRE_HITL (agent-core-v1.0)
+  // Only admin and operator roles have hitl:resolve permission.
+  // ═══════════════════════════════════════════════════════════════════
+
+  server.registerTool(
+    "promptcraft_resolve_hitl",
+    {
+      title: "Resolve HITL Approval",
+      description: `Approve or reject a pending HITL (Human-In-The-Loop) execution request.
+Only admins and operators can resolve HITL requests.
+
+When approved: the blocked promptcraft_execute_prompt call proceeds to inference.
+When rejected: the execution is cancelled and the rejection is recorded in the audit trail.
+If the request has already reached a terminal state (approved/rejected/timed_out),
+this call returns an error — double-resolution is rejected by design.
+
+SPEC KIT: A3 Approval Bypass / REQUIRE_HITL`,
+      inputSchema: ResolveHITLSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async (params) => {
+      const result = await resolveHITLApproval(
+        env.AUDIT_DB,
+        params.requestId,
+        params.resolution,
+        userId
+      );
+
+      if (!result.ok) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: result.error ?? "Failed to resolve HITL approval" }],
+        };
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            requestId: params.requestId,
+            resolution: params.resolution,
+            resolvedBy: userId,
+            resolvedAt: new Date().toISOString(),
+          }),
+        }],
+      };
+    }
+  );
+
+  server.registerTool(
+    "promptcraft_get_hitl_status",
+    {
+      title: "Get HITL Approval Status",
+      description: `Check the status of a HITL approval request by request ID.
+Returns the current status (pending/approved/rejected/timed_out),
+expiry time, resolution details, and original request context.`,
+      inputSchema: GetHITLStatusSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (params) => {
+      const status = await getHITLApprovalStatus(env.AUDIT_DB, params.requestId);
+
+      if (!status) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `HITL request not found: ${params.requestId}` }],
+        };
+      }
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(status, null, 2) }],
+      };
+    }
+  );
+
+  server.registerTool(
+    "promptcraft_list_pending_hitl",
+    {
+      title: "List Pending HITL Approvals",
+      description: `List all currently pending HITL approval requests that have not yet expired.
+Used by admin/operator dashboards to surface outstanding execution approvals.
+Returns request ID, template ID, requesting user, expiry time, and context summary.
+Expired and terminal requests are excluded — use promptcraft_query_audit for history.`,
+      inputSchema: ListPendingHITLSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (params) => {
+      const pending = await listPendingHITLApprovals(env.AUDIT_DB, params.limit ?? 50);
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            pending,
+            count: pending.length,
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════════════
   // VALIDATION TOOL (dry-run, no inference)
   // ═══════════════════════════════════════════════════════════════════
 
@@ -518,7 +658,6 @@ Returns sanitization results, detected threats, compiled prompt preview, and tem
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async (params) => {
-      // Load template
       const template = await env.PROMPT_TEMPLATES.get(`template:${params.templateId}`, "json") as PromptTemplate | null;
       if (!template) {
         return { isError: true, content: [{ type: "text", text: `Template not found: ${params.templateId}` }] };
@@ -542,6 +681,7 @@ Returns sanitization results, detected threats, compiled prompt preview, and tem
           type: "text",
           text: JSON.stringify({
             templateIntegrity: hmacValid ? "verified" : "FAILED — possible tampering",
+            requiresHITL: template.requiresHITL,
             inputValidation: verdict,
             threats,
             promptPreview: {
@@ -564,7 +704,8 @@ Returns sanitization results, detected threats, compiled prompt preview, and tem
     "promptcraft_query_audit",
     {
       title: "Query Audit Logs",
-      description: "Query the prompt execution audit trail with filters for user, template, status, and time range.",
+      description: `Query the prompt execution audit trail with filters for user, template, status, and time range.
+Status values include hitl_rejected and hitl_timeout for HITL gate decisions.`,
       inputSchema: QueryAuditSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },

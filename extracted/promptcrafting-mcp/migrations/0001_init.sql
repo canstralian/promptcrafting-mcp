@@ -1,6 +1,9 @@
 -- migrations/0001_init.sql
 -- D1 schema for promptcrafting-mcp audit trail
 -- Run with: wrangler d1 execute promptcrafting-audit --file=migrations/0001_init.sql
+--
+-- Changelog:
+--   - Added hitl_rejected and hitl_timeout to prompt_audit_logs.status CHECK constraint
 
 -- ─── Prompt Audit Logs ─────────────────────────────────────────────
 -- Records every prompt execution with guardrail results.
@@ -13,7 +16,10 @@ CREATE TABLE IF NOT EXISTS prompt_audit_logs (
   template_version INTEGER NOT NULL DEFAULT 1,
   user_id         TEXT    NOT NULL,
   model           TEXT    NOT NULL,
-  status          TEXT    NOT NULL CHECK(status IN ('success','error','rate_limited','filtered')),
+  status          TEXT    NOT NULL CHECK(status IN (
+                    'success','error','rate_limited','filtered',
+                    'hitl_rejected','hitl_timeout'
+                  )),
   latency_ms      INTEGER NOT NULL DEFAULT 0,
   input_tokens    INTEGER NOT NULL DEFAULT 0,
   output_tokens   INTEGER NOT NULL DEFAULT 0,
