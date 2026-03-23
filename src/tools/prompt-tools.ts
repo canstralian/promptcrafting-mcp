@@ -19,7 +19,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Env, PromptTemplate } from "../types.js";
 import {
   CreateTemplateSchema, UpdateTemplateSchema, GetTemplateSchema,
-  ListTemplatesSchema, DeleteTemplateSchema, ExecutePromptSchema,
+  ListTemplatesSchema, DeleteTemplateSchema, SetABWeightSchema, ExecutePromptSchema,
   ValidatePromptSchema, QueryAuditSchema,
   ResolveHITLSchema, GetHITLStatusSchema, ListPendingHITLSchema,
 } from "../schemas/index.js";
@@ -39,6 +39,67 @@ import {
 
 // ─── Register All Tools ────────────────────────────────────────────
 export function registerPromptTools(server: McpServer, env: Env, userId: string): void {
+
+  // ═══════════════════════════════════════════════════════════════════
+  // A/B TESTING HELPER FUNCTIONS
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Resolves a template version probabilistically based on A/B weights.
+   * If no templateVersion is specified, fetches all versions from KV and
+   * selects one based on relative weights.
+   */
+  async function resolveTemplateVersion(
+    templateId: string,
+    requestedVersion?: number
+  ): Promise<PromptTemplate | null> {
+    // If version is explicitly requested, load it directly
+    if (requestedVersion) {
+      const key = `template:${templateId}:v${requestedVersion}`;
+      return await env.PROMPT_TEMPLATES.get(key, "json") as PromptTemplate | null;
+    }
+
+    // No version specified — perform probabilistic routing
+    // List all versioned keys for this template
+    const prefix = `template:${templateId}:v`;
+    const list = await env.PROMPT_TEMPLATES.list({ prefix });
+
+    if (!list.keys.length) {
+      // No versioned copies, try latest
+      return await env.PROMPT_TEMPLATES.get(`template:${templateId}`, "json") as PromptTemplate | null;
+    }
+
+    // Fetch all versions to get their weights
+    const versions: PromptTemplate[] = [];
+    for (const k of list.keys) {
+      const template = await env.PROMPT_TEMPLATES.get(k.name, "json") as PromptTemplate | null;
+      if (template) {
+        versions.push(template);
+      }
+    }
+
+    if (versions.length === 0) return null;
+    if (versions.length === 1) return versions[0];
+
+    // Calculate total weight
+    const totalWeight = versions.reduce((sum, t) => sum + t.abWeight, 0);
+    if (totalWeight === 0) {
+      // All weights are 0, return random version
+      return versions[Math.floor(Math.random() * versions.length)];
+    }
+
+    // Weighted random selection
+    let random = Math.random() * totalWeight;
+    for (const template of versions) {
+      random -= template.abWeight;
+      if (random <= 0) {
+        return template;
+      }
+    }
+
+    // Fallback (shouldn't reach here)
+    return versions[versions.length - 1];
+  }
 
   // ═══════════════════════════════════════════════════════════════════
   // TEMPLATE MANAGEMENT TOOLS
@@ -344,6 +405,81 @@ Partial updates are supported — only supply the fields you want to change.`,
     }
   );
 
+  server.registerTool(
+    "promptcraft_set_ab_weight",
+    {
+      title: "Set A/B Testing Weight",
+      description: `Set the A/B testing weight for a specific template version.
+Weights are used for probabilistic version routing when no templateVersion is
+specified in promptcraft_execute_prompt. Higher weights receive proportionally
+more traffic.
+
+Example: Two versions with weights 0.9 and 0.1 will route 90% and 10% of traffic
+respectively. Weights are relative — (0.9, 0.1) behaves the same as (9, 1).
+
+This tool only updates the weight for a specific version in KV metadata. It does
+not modify the template content or increment the version number.`,
+      inputSchema: SetABWeightSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (params) => {
+      // Load the specific versioned template
+      const key = `template:${params.templateId}:v${params.version}`;
+      const template = await env.PROMPT_TEMPLATES.get(key, "json") as PromptTemplate | null;
+
+      if (!template) {
+        return {
+          isError: true,
+          content: [{
+            type: "text",
+            text: `Template version not found: ${params.templateId} v${params.version}`,
+          }],
+        };
+      }
+
+      // Update the abWeight in the template
+      const updatedTemplate: PromptTemplate = {
+        ...template,
+        abWeight: params.abWeight,
+        updatedAt: new Date().toISOString(),
+      };
+
+      // Store the updated versioned copy
+      await env.PROMPT_TEMPLATES.put(
+        key,
+        JSON.stringify(updatedTemplate),
+        { expirationTtl: 60 * 60 * 24 * 90 }
+      );
+
+      // If this is the latest version, also update the latest key
+      const latest = await env.PROMPT_TEMPLATES.get(`template:${params.templateId}`, "json") as PromptTemplate | null;
+      if (latest && latest.version === params.version) {
+        const updatedLatest = {
+          ...latest,
+          abWeight: params.abWeight,
+          updatedAt: new Date().toISOString(),
+        };
+        await env.PROMPT_TEMPLATES.put(
+          `template:${params.templateId}`,
+          JSON.stringify(updatedLatest),
+          { metadata: { name: updatedLatest.name, version: updatedLatest.version, abWeight: updatedLatest.abWeight } }
+        );
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            templateId: params.templateId,
+            version: params.version,
+            abWeight: params.abWeight,
+            updated: true,
+          }),
+        }],
+      };
+    }
+  );
+
   // ═══════════════════════════════════════════════════════════════════
   // EXECUTION TOOL — with HITL gate (SPEC KIT A3)
   // ═══════════════════════════════════════════════════════════════════
@@ -353,7 +489,7 @@ Partial updates are supported — only supply the fields you want to change.`,
     {
       title: "Execute Prompt",
       description: `Execute a prompt template with the full security pipeline:
-1. Load template from KV with HMAC verification
+1. Load template from KV with HMAC verification (A/B tested if no version specified)
 2. [HITL] If template.requiresHITL is true: request human approval and block
    until approved, rejected, or HITL_TIMEOUT_MS elapses. Timeout routes to
    dead-letter — never to silent pass. (SPEC KIT A3: Approval Bypass / REQUIRE_HITL)
@@ -361,7 +497,10 @@ Partial updates are supported — only supply the fields you want to change.`,
 4. Compile four-layer prompt with structured separation + sandwich defense
 5. Run inference via Workers AI
 6. Validate output (schema, PII, leakage, canary token)
-7. Log audit trail to D1
+7. Log audit trail to D1 (including resolved version)
+
+If no templateVersion is specified, a version is selected probabilistically based
+on abWeight values. Higher weights receive proportionally more traffic.
 
 Returns the model output, guardrail results, and usage metrics.
 Fail-closed: if any guardrail fails, the output is NOT returned.`,
@@ -372,11 +511,8 @@ Fail-closed: if any guardrail fails, the output is NOT returned.`,
       const requestId = crypto.randomUUID();
       const startTime = Date.now();
 
-      // ── Step 1: Load and verify template ──────────────────────────
-      const key = params.templateVersion
-        ? `template:${params.templateId}:v${params.templateVersion}`
-        : `template:${params.templateId}`;
-      const template = await env.PROMPT_TEMPLATES.get(key, "json") as PromptTemplate | null;
+      // ── Step 1: Load and verify template (with A/B resolution) ────────
+      const template = await resolveTemplateVersion(params.templateId, params.templateVersion);
 
       if (!template) {
         return { isError: true, content: [{ type: "text", text: `Template not found: ${params.templateId}` }] };
