@@ -47,7 +47,11 @@ const INJECTION_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
 
 // ─── Invisible Character Ranges ────────────────────────────────────
 // Unicode Tag characters (U+E0000–E007F) + zero-width characters
-const INVISIBLE_CHAR_PATTERN = /[\u200B\u200C\u200D\u2060\uFEFF\u00AD\u034F\u061C\u180E\u2000-\u200F\u202A-\u202E\u2066-\u2069\uE0000-\uE007F]/g;
+// Note: Unicode Tags block (U+E0000–E007F) requires the `u` flag and \u{...} syntax.
+// Without the `u` flag, \uE0000 is mis-parsed as \uE000 + literal '0', creating a
+// range '0'–U+E007 that incorrectly matches all ASCII letters and digits.
+const INVISIBLE_CHAR_PATTERN = /[\u200B\u200C\u200D\u2060\uFEFF\u00AD\u034F\u061C\u180E\u2000-\u200F\u202A-\u202E\u2066-\u2069]/g;
+const UNICODE_TAGS_PATTERN = /[\u{E0000}-\u{E007F}]/gu;
 
 // ─── Shannon Entropy ───────────────────────────────────────────────
 function shannonEntropy(str: string): number {
@@ -87,11 +91,13 @@ export function sanitizeInput(
   }
 
   // 2. Strip invisible characters (before normalization, to avoid smuggling)
-  const invisibleCount = (input.match(INVISIBLE_CHAR_PATTERN) || []).length;
+  const invisibleCount =
+    (input.match(INVISIBLE_CHAR_PATTERN) || []).length +
+    (input.match(UNICODE_TAGS_PATTERN) || []).length;
   if (invisibleCount > 0) {
     threats.push(`invisible_chars:${invisibleCount}`);
   }
-  let cleaned = input.replace(INVISIBLE_CHAR_PATTERN, "");
+  let cleaned = input.replace(INVISIBLE_CHAR_PATTERN, "").replace(UNICODE_TAGS_PATTERN, "");
 
   // 3. NFKC Unicode normalization (collapses homoglyphs)
   cleaned = cleaned.normalize("NFKC");

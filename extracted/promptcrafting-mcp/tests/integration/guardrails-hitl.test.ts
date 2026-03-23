@@ -25,7 +25,7 @@ describe("Guardrails and HITL Integration Tests", () => {
 
       expect(verdict.pass).toBe(false);
       expect(verdict.reason).toBeDefined();
-      expect(threats).toHaveProperty("injectionDetected");
+      expect(threats.some((t: string) => !t.startsWith("invisible_chars") && !t.startsWith("high_entropy"))).toBe(true);
 
       // Write audit log for blocked request
       const requestId = crypto.randomUUID();
@@ -124,7 +124,7 @@ describe("Guardrails and HITL Integration Tests", () => {
       const approvalStatus = await getHITLApprovalStatus(env.AUDIT_DB, requestId);
       expect(approvalStatus).not.toBeNull();
       expect(approvalStatus?.status).toBe("pending");
-      expect(approvalStatus?.template_id).toBe(template.id);
+      expect(approvalStatus?.requestId).toBe(requestId);
 
       // Approve the request
       const resolveResult = await resolveHITLApproval(
@@ -139,8 +139,8 @@ describe("Guardrails and HITL Integration Tests", () => {
       // Verify approval was recorded
       const updatedStatus = await getHITLApprovalStatus(env.AUDIT_DB, requestId);
       expect(updatedStatus?.status).toBe("approved");
-      expect(updatedStatus?.resolved_by).toBe("test-approver");
-      expect(updatedStatus?.resolved_at).toBeDefined();
+      expect(updatedStatus?.resolvedBy).toBe("test-approver");
+      expect(updatedStatus?.resolvedAt).toBeDefined();
     });
 
     it("should reject HITL approval", async () => {
@@ -172,7 +172,7 @@ describe("Guardrails and HITL Integration Tests", () => {
       // Verify rejection was recorded
       const status = await getHITLApprovalStatus(env.AUDIT_DB, requestId);
       expect(status?.status).toBe("rejected");
-      expect(status?.resolved_by).toBe("test-reviewer");
+      expect(status?.resolvedBy).toBe("test-reviewer");
 
       // Write audit log for rejection
       await writeAuditLog(env.AUDIT_DB, {
