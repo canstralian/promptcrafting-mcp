@@ -60,6 +60,11 @@ export interface PromptTemplate {
   // dead-letter — never to silent pass.
   requiresHITL: boolean;
 
+  // A/B Testing Weight (0.0–1.0, default 1.0)
+  // Used for probabilistic version routing when no templateVersion is specified.
+  // Higher weights receive proportionally more traffic.
+  abWeight: number;
+
   // Metadata
   tags: string[];
   model?: string;         // Target model hint

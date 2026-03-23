@@ -79,6 +79,7 @@ Returns the template ID, version, and content hash.`,
         .tags(params.tags ?? [])
         .model(params.model)
         .requiresHITL(params.requiresHITL ?? false)
+        .abWeight(params.abWeight ?? 1.0)
         .createdBy(userId)
         .build(env.TEMPLATE_HMAC_KEY);
 
@@ -86,7 +87,7 @@ Returns the template ID, version, and content hash.`,
       await env.PROMPT_TEMPLATES.put(
         `template:${template.id}`,
         JSON.stringify(template),
-        { metadata: { name: template.name, version: template.version } }
+        { metadata: { name: template.name, version: template.version, abWeight: template.abWeight } }
       );
       // Store versioned copy (90-day retention)
       await env.PROMPT_TEMPLATES.put(
@@ -290,6 +291,7 @@ Partial updates are supported — only supply the fields you want to change.`,
         tags: params.tags ?? raw.tags,
         model: params.model ?? raw.model,
         requiresHITL: params.requiresHITL !== undefined ? params.requiresHITL : raw.requiresHITL,
+        abWeight: params.abWeight !== undefined ? params.abWeight : raw.abWeight,
         version: raw.version + 1,
         updatedAt: new Date().toISOString(),
       };
@@ -308,7 +310,7 @@ Partial updates are supported — only supply the fields you want to change.`,
       await env.PROMPT_TEMPLATES.put(
         `template:${updatedTemplate.id}`,
         JSON.stringify(updatedTemplate),
-        { metadata: { name: updatedTemplate.name, version: updatedTemplate.version } }
+        { metadata: { name: updatedTemplate.name, version: updatedTemplate.version, abWeight: updatedTemplate.abWeight } }
       );
       await env.PROMPT_TEMPLATES.put(
         `template:${updatedTemplate.id}:v${updatedTemplate.version}`,

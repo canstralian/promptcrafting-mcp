@@ -140,6 +140,7 @@ export class PromptTemplateBuilder {
   private _model?: string;
   private _createdBy = "system";
   private _requiresHITL = false;  // SPEC KIT A3: Approval Bypass / REQUIRE_HITL
+  private _abWeight = 1.0;  // A/B testing weight (0.0–1.0, default 1.0)
 
   constructor(id?: string) {
     this._id = id ?? crypto.randomUUID();
@@ -161,6 +162,13 @@ export class PromptTemplateBuilder {
    * SPEC KIT: A3 Approval Bypass / REQUIRE_HITL (agent-core-v1.0)
    */
   requiresHITL(r: boolean): this { this._requiresHITL = r; return this; }
+
+  /**
+   * Set A/B testing weight (0.0–1.0, default 1.0).
+   * Used for probabilistic version routing when no templateVersion is specified.
+   * Higher weights receive proportionally more traffic.
+   */
+  abWeight(w: number): this { this._abWeight = w; return this; }
 
   async build(hmacKey: string): Promise<PromptTemplate> {
     if (!this._name) throw new Error("Template name is required");
@@ -188,6 +196,7 @@ export class PromptTemplateBuilder {
       contentHash,
       hmacSignature,
       requiresHITL: this._requiresHITL,
+      abWeight: this._abWeight,
       tags: this._tags,
       model: this._model,
       createdBy: this._createdBy,
