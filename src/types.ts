@@ -53,6 +53,13 @@ export interface PromptTemplate {
   contentHash: string;   // SHA-256 of compiled template
   hmacSignature: string; // HMAC-SHA256 signed by TEMPLATE_HMAC_KEY
 
+  // HITL gate (SPEC KIT: A3 Approval Bypass / REQUIRE_HITL)
+  // When true, every execution of this template must be approved before
+  // the prompt is submitted to the AI model. Execution blocks until
+  // approved, rejected, or HITL_TIMEOUT_MS elapses. Timeout routes to
+  // dead-letter — never to silent pass.
+  requiresHITL: boolean;
+
   // Metadata
   tags: string[];
   model?: string;         // Target model hint
@@ -100,7 +107,7 @@ export interface AuditLogEntry {
   templateVersion: number;
   userId: string;
   model: string;
-  status: "success" | "error" | "rate_limited" | "filtered";
+  status: "success" | "error" | "rate_limited" | "filtered" | "hitl_rejected" | "hitl_timeout";
   latencyMs: number;
   inputTokens: number;
   outputTokens: number;
@@ -134,16 +141,19 @@ export const ROLE_PERMISSIONS = {
     "prompt:execute", "prompt:validate",
     "audit:read", "audit:export",
     "config:read", "config:write",
+    "hitl:resolve",  // Can approve/reject HITL requests
   ],
   operator: [
     "template:read",
     "prompt:execute", "prompt:validate",
     "audit:read",
     "config:read",
+    "hitl:resolve",  // Operators can also approve/reject
   ],
   viewer: [
     "template:read",
     "audit:read",
+    // hitl:resolve intentionally absent — viewers cannot approve executions
   ],
 } as const;
 

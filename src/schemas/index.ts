@@ -34,6 +34,9 @@ export const CreateTemplateSchema = z.object({
     .describe("Categorization tags"),
   model: z.string().max(100).optional()
     .describe("Target model hint (e.g., @cf/meta/llama-4-scout-17b-16e-instruct)"),
+  // HITL gate — SPEC KIT A3: Approval Bypass / REQUIRE_HITL
+  requiresHITL: z.boolean().default(false)
+    .describe("When true, every execution blocks until a human approves (admin/operator). Timeout routes to dead-letter, never silent pass."),
 }).strict();
 
 export const UpdateTemplateSchema = z.object({
@@ -45,6 +48,8 @@ export const UpdateTemplateSchema = z.object({
   description: z.string().max(500).optional(),
   tags: z.array(z.string().max(50)).max(20).optional(),
   model: z.string().max(100).optional(),
+  requiresHITL: z.boolean().optional()
+    .describe("Enable or disable HITL gate on this template"),
 }).strict();
 
 export const GetTemplateSchema = z.object({
@@ -92,12 +97,32 @@ export const ValidatePromptSchema = z.object({
   variables: z.record(z.string(), z.string().max(10000)).default({}),
 }).strict();
 
+// ─── HITL Tool Schemas ─────────────────────────────────────────────
+// SPEC KIT: A3 Approval Bypass / REQUIRE_HITL (agent-core-v1.0)
+
+export const ResolveHITLSchema = z.object({
+  requestId: z.string().uuid("Invalid request ID format")
+    .describe("The request ID of the pending HITL approval"),
+  resolution: z.enum(["approved", "rejected"])
+    .describe("Decision: approve execution or reject it"),
+}).strict();
+
+export const GetHITLStatusSchema = z.object({
+  requestId: z.string().uuid("Invalid request ID format")
+    .describe("The request ID to check"),
+}).strict();
+
+export const ListPendingHITLSchema = z.object({
+  limit: z.number().int().min(1).max(100).default(50)
+    .describe("Maximum number of pending approvals to return"),
+}).strict();
+
 // ─── Audit Query Schemas ───────────────────────────────────────────
 
 export const QueryAuditSchema = z.object({
   userId: z.string().optional(),
   templateId: z.string().uuid().optional(),
-  status: z.enum(["success", "error", "rate_limited", "filtered"]).optional(),
+  status: z.enum(["success", "error", "rate_limited", "filtered", "hitl_rejected", "hitl_timeout"]).optional(),
   since: z.string().datetime().optional()
     .describe("ISO 8601 datetime — return logs after this time"),
   limit: z.number().int().min(1).max(200).default(50),
@@ -130,4 +155,7 @@ export type ListTemplatesInput = z.infer<typeof ListTemplatesSchema>;
 export type DeleteTemplateInput = z.infer<typeof DeleteTemplateSchema>;
 export type ExecutePromptInput = z.infer<typeof ExecutePromptSchema>;
 export type ValidatePromptInput = z.infer<typeof ValidatePromptSchema>;
+export type ResolveHITLInput = z.infer<typeof ResolveHITLSchema>;
+export type GetHITLStatusInput = z.infer<typeof GetHITLStatusSchema>;
+export type ListPendingHITLInput = z.infer<typeof ListPendingHITLSchema>;
 export type QueryAuditInput = z.infer<typeof QueryAuditSchema>;

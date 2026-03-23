@@ -6,6 +6,10 @@
 //   - Content hashing for version integrity
 //   - Canary token injection for extraction detection
 //   - Variable interpolation with sanitization
+//
+// Changelog:
+//   - [HITL] PromptTemplateBuilder.requiresHITL() method added
+//           PromptTemplate.requiresHITL field included in build() output
 
 import type { PromptTemplate } from "../types.js";
 import { applyStructuredSeparation, applySandwichDefense } from "../guardrails/input-sanitizer.js";
@@ -135,6 +139,7 @@ export class PromptTemplateBuilder {
   private _tags: string[] = [];
   private _model?: string;
   private _createdBy = "system";
+  private _requiresHITL = false;  // SPEC KIT A3: Approval Bypass / REQUIRE_HITL
 
   constructor(id?: string) {
     this._id = id ?? crypto.randomUUID();
@@ -147,8 +152,15 @@ export class PromptTemplateBuilder {
   constraints(c: string): this { this._constraints = c; return this; }
   outputShape(s: string): this { this._outputShape = s; return this; }
   tags(t: string[]): this { this._tags = t; return this; }
-  model(m: string): this { this._model = m; return this; }
+  model(m?: string): this { if (m) this._model = m; return this; }
   createdBy(u: string): this { this._createdBy = u; return this; }
+
+  /**
+   * When true, every execution of this template requires human approval
+   * before the prompt is submitted to the AI model.
+   * SPEC KIT: A3 Approval Bypass / REQUIRE_HITL (agent-core-v1.0)
+   */
+  requiresHITL(r: boolean): this { this._requiresHITL = r; return this; }
 
   async build(hmacKey: string): Promise<PromptTemplate> {
     if (!this._name) throw new Error("Template name is required");
@@ -175,6 +187,7 @@ export class PromptTemplateBuilder {
       layers,
       contentHash,
       hmacSignature,
+      requiresHITL: this._requiresHITL,
       tags: this._tags,
       model: this._model,
       createdBy: this._createdBy,
