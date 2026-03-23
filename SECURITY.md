@@ -18,8 +18,8 @@ Please do **not** report security vulnerabilities through public GitHub issues, 
 
 Instead, report vulnerabilities privately to:
 
-- Email: [security@yourdomain.com]
-- Or: [link to private security reporting channel or GitHub Security Advisories]
+- Email: security@example.com
+- Or: Report a vulnerability privately via [GitHub Security Advisories](https://github.com/OWNER/REPO/security/advisories/new).
 
 When submitting a report, include as much of the following as possible:
 
