@@ -1,1 +1,17 @@
 .agents/.env
+
+# Dependencies
+node_modules/
+extracted/**/node_modules/
+
+# Build artifacts
+build/
+dist/
+coverage/
+
+# Cloudflare / local tooling
+.wrangler/
+
+# Logs
+*.log
+npm-debug.log*
