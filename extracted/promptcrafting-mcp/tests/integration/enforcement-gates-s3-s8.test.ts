@@ -44,7 +44,7 @@ describe("M3 enforcement interceptor proofs (S3-S5, S7-S8)", () => {
 
     expect(verdict.pass).toBe(true);
     expect(sanitized).toBe("safe-content");
-    expect(threats.some((t) => t.startsWith("invisible_chars:"))).toBe(true);
+    expect(threats).toEqual(["invisible_chars:2"]);
   });
 
   it("S8 — records high-entropy payload risk without false blocking in isolation", () => {
