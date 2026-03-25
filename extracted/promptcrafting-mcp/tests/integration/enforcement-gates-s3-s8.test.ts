@@ -54,6 +54,6 @@ describe("M3 enforcement interceptor proofs (S3-S5, S7-S8)", () => {
     });
 
     expect(verdict.pass).toBe(true);
-    expect(threats.some((t) => t.startsWith("high_entropy:"))).toBe(true);
+    expect(threats).toEqual(["high_entropy:6.00"]);
   });
 });
