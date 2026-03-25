@@ -13,7 +13,7 @@ describe("M3 enforcement interceptor proofs (S3-S5, S7-S8)", () => {
     );
 
     expect(verdict.pass).toBe(false);
-    expect(threats).toContain("instruction_override");
+    expect(threats).toEqual(["instruction_override"]);
   });
 
   it("S4 — blocks role impersonation gate", () => {
