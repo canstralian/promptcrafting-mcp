@@ -33,7 +33,7 @@ describe("M3 enforcement interceptor proofs (S3-S5, S7-S8)", () => {
     );
 
     expect(verdict.pass).toBe(false);
-    expect(threats).toContain("persistent_override");
+    expect(threats).toEqual(["persistent_override"]);
   });
 
   it("S7 — strips invisible Unicode smuggling while preserving fail-closed reporting", () => {
