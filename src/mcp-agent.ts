@@ -14,6 +14,7 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Env } from "./types.js";
 import { registerPromptTools } from "./tools/prompt-tools.js";
+import { TemplateRepository } from "./services/template-repository.js";
 
 // ─── Durable Object State ──────────────────────────────────────────
 interface AgentState {
@@ -136,7 +137,8 @@ export class PromptMCPServer extends McpAgent<Env, AgentState> {
         mimeType: "application/json",
       },
       async () => {
-        const list = await this.env.PROMPT_TEMPLATES.list({ prefix: "template:", limit: 100 });
+        const templatesRepo = new TemplateRepository(this.env.PROMPT_TEMPLATES, this.env.TEMPLATE_HMAC_KEY);
+        const list = await templatesRepo.listLatest(100);
         const templates = list.keys
           .filter((k) => !k.name.includes(":v"))
           .map((k) => ({
