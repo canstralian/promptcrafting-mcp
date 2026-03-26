@@ -1,2 +1,10 @@
 node_modules/
 .agents/.env
+node_modules/
+dist/
+*.log
+.DS_Store
+.env
+.env.local
+.wrangler/
+wrangler.toml.local

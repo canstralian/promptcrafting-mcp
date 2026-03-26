@@ -621,23 +621,28 @@ expiry time, resolution details, and original request context.`,
   server.registerTool(
     "promptcraft_list_pending_hitl",
     {
-      title: "List Pending HITL Approvals",
-      description: `List all currently pending HITL approval requests that have not yet expired.
-Used by admin/operator dashboards to surface outstanding execution approvals.
-Returns request ID, template ID, requesting user, expiry time, and context summary.
-Expired and terminal requests are excluded — use promptcraft_query_audit for history.`,
+      title: "List HITL Approvals by Status",
+      description: `List HITL approval requests filtered by status.
+Status options: 'pending' (default, unexpired requests), 'timed_out' (expired), 'approved', 'rejected', or 'all'.
+Used by admin/operator dashboards to surface outstanding or historical approvals.
+Returns request ID, template ID, requesting user, status, expiry time, and context summary.`,
       inputSchema: ListPendingHITLSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async (params) => {
-      const pending = await listPendingHITLApprovals(env.AUDIT_DB, params.limit ?? 50);
+      const approvals = await listPendingHITLApprovals(
+        env.AUDIT_DB,
+        params.limit ?? 50,
+        params.status ?? "pending"
+      );
 
       return {
         content: [{
           type: "text",
           text: JSON.stringify({
-            pending,
-            count: pending.length,
+            approvals,
+            count: approvals.length,
+            filter: params.status ?? "pending",
           }, null, 2),
         }],
       };
