@@ -20,6 +20,7 @@ import type {
   Tool,
   ToolInputSchema,
 } from "@modelcontextprotocol/sdk/shared/types.js";
+import { z } from "zod";
 import type { Env, PromptTemplate } from "../types.js";
 import {
   CreateTemplateSchema,
@@ -49,8 +50,7 @@ import {
   queryAuditLogs,
 } from "../services/audit.js";
 import {
-  requestHITLApproval,
-  waitForHITLDecision,
+  ensureExecutionReady,
   resolveHITLApproval,
   getHITLApprovalStatus,
   listPendingHITLApprovals,
@@ -62,6 +62,40 @@ export function registerPromptTools(
   env: Env,
   userId: string,
 ): void {
+  function parseOutputSchema(schemaText?: string): z.ZodTypeAny | undefined {
+    if (!schemaText) return undefined;
+
+    try {
+      const schema = JSON.parse(schemaText) as {
+        type?: string;
+        properties?: Record<string, { type?: string }>;
+        required?: string[];
+      };
+
+      if (schema.type !== "object" || !schema.properties) {
+        return z.unknown();
+      }
+
+      const shape = Object.fromEntries(
+        Object.entries(schema.properties).map(([key, value]) => {
+          const base = value?.type === "number"
+            ? z.number()
+            : value?.type === "boolean"
+              ? z.boolean()
+              : value?.type === "array"
+                ? z.array(z.unknown())
+                : z.string();
+          const required = schema.required?.includes(key) ?? false;
+          return [key, required ? base : base.optional()];
+        }),
+      );
+
+      return z.object(shape).passthrough();
+    } catch {
+      return z.never();
+    }
+  }
+
   // ═══════════════════════════════════════════════════════════════════
   // TEMPLATE MANAGEMENT TOOLS
   // ═══════════════════════════════════════════════════════════════════
@@ -505,7 +539,7 @@ Fail-closed: if any guardrail fails, the output is NOT returned.`,
       },
     },
     async (params: Record<string, unknown>) => {
-      const requestId = globalThis.crypto?.getRandomValues(new Uint8Array(16)) ?? Array(16).fill(0);
+      const requestId = (params.requestId as string | undefined) ?? crypto.randomUUID();
       const startTime = Date.now();
 
       // ── Step 1: Load and verify template ──────────────────────────
@@ -562,69 +596,45 @@ Fail-closed: if any guardrail fails, the output is NOT returned.`,
       // INVARIANT: if requiresHITL is true and decision is not 'approved',
       // execution MUST NOT proceed. This check is unconditional — there is no
       // bypass path, no default-allow fallback, no exception for timeouts.
-      if (template.requiresHITL) {
-        const timeoutMs = parseInt(env.HITL_TIMEOUT_MS || "300000", 10);
+      const timeoutMs = parseInt(env.HITL_TIMEOUT_MS || "300000", 10);
+      const variablesHash = await hashContent(JSON.stringify(params.variables));
+      const gate = await ensureExecutionReady(env.AUDIT_DB, {
+        requestId,
+        templateId: template.id,
+        templateName: template.name,
+        userId,
+        variablesHash,
+        timeoutMs,
+        requiresHITL: template.requiresHITL,
+      });
 
-        // Hash variables so we audit context without exposing values
-        const variablesHash = await hashContent(
-          JSON.stringify(params.variables),
-        );
+      if (gate.state === "pending_hitl") {
+        return {
+          content: [{ type: "text", text: JSON.stringify(gate, null, 2) }],
+        };
+      }
 
-        // Write pending approval record
-        await requestHITLApproval(env.AUDIT_DB, {
+      if (gate.state === "blocked") {
+        const status = gate.reason === "timed_out" ? "hitl_timeout" : "hitl_rejected";
+        await writeAuditLog(env.AUDIT_DB, {
           requestId,
-          templateId: template.id,
-          templateName: template.name,
+          sessionId: null,
+          templateId: params.templateId,
+          templateVersion: template.version,
           userId,
-          variablesHash,
-          timeoutMs,
+          model: params.model ?? "none",
+          status,
+          latencyMs: Date.now() - startTime,
+          inputTokens: 0,
+          outputTokens: 0,
+          guardrailFlags: JSON.stringify({ hitlGate: true, reason: gate.reason }),
+          createdAt: new Date().toISOString(),
         });
 
-        globalThis.console?.log?.(
-          `[HITL] Approval requested for ${requestId} (template: ${template.name}, timeout: ${timeoutMs}ms)`,
-        );
-
-        // Block until approved, rejected, or timed out
-        const decision = await waitForHITLDecision(
-          env.AUDIT_DB,
-          requestId,
-          timeoutMs,
-        );
-
-        if (!decision.approved) {
-          const status =
-            decision.reason === "timed_out" ? "hitl_timeout" : "hitl_rejected";
-
-          await writeAuditLog(env.AUDIT_DB, {
-            requestId,
-            sessionId: null,
-            templateId: params.templateId,
-            templateVersion: template.version,
-            userId,
-            model: params.model ?? "none",
-            status,
-            latencyMs: Date.now() - startTime,
-            inputTokens: 0,
-            outputTokens: 0,
-            guardrailFlags: JSON.stringify({
-              hitlGate: true,
-              decision: decision.reason,
-              resolvedBy: decision.resolvedBy ?? null,
-            }),
-            createdAt: new Date().toISOString(),
-          });
-
-          const message =
-            decision.reason === "timed_out"
-              ? `Execution blocked: HITL approval timed out after ${timeoutMs}ms. Request ${requestId} routed to dead-letter queue.`
-              : `Execution blocked: HITL approval rejected by ${decision.resolvedBy ?? "reviewer"}.`;
-
-          return { isError: true, content: [{ type: "text", text: message }] };
-        }
-
-        globalThis.console?.log?.(
-          `[HITL] Approved for ${requestId} by ${decision.resolvedBy}`,
-        );
+        return {
+          isError: true,
+          content: [{ type: "text", text: JSON.stringify(gate, null, 2) }],
+        };
       }
 
       // ── Step 3: Sanitize user input ───────────────────────────────
@@ -712,6 +722,7 @@ Fail-closed: if any guardrail fails, the output is NOT returned.`,
       // ── Step 6: Validate output ───────────────────────────────────
       const outputValidation = validateOutput(rawOutput, {
         canaryToken,
+        schema: parseOutputSchema(params.outputSchema as string | undefined),
         redactPII: true,
       });
 

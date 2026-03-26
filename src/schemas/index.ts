@@ -73,6 +73,8 @@ export const DeleteTemplateSchema = z.object({
 // ─── Prompt Execution Schemas ──────────────────────────────────────
 
 export const ExecutePromptSchema = z.object({
+  requestId: z.string().uuid("Invalid request ID format").optional()
+    .describe("Optional execution request ID used for resumable HITL workflows"),
   templateId: z.string().uuid("Invalid template ID format"),
   templateVersion: z.number().int().positive().optional(),
   userInput: z.string()

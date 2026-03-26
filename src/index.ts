@@ -11,10 +11,12 @@ import { cors } from "hono/cors";
 import { secureHeaders } from "hono/secure-headers";
 import { routeAgentRequest } from "agents";
 import type { Env } from "./types.js";
-import { authMiddleware, rateLimitMiddleware, requirePermission } from "./middleware/auth.js";
+import { authMiddleware, preAuthBurstLimit, identityRateLimit, requirePermission } from "./middleware/auth.js";
 import {
   resolveHITLApproval, getHITLApprovalStatus, listPendingHITLApprovals,
 } from "./services/hitl.js";
+import { queryAuditLogs } from "./services/audit.js";
+import { TemplateRepository } from "./services/template-repository.js";
 
 // Re-export the Durable Object class (required by Workers runtime)
 export { PromptMCPServer } from "./mcp-agent.js";
@@ -48,7 +50,7 @@ app.get("/health", (c) =>
 // ─── MCP Protocol Endpoint ─────────────────────────────────────────
 // The Agents SDK handles MCP transport (Streamable HTTP + WebSocket hibernation).
 // Auth + rate limiting applied before routing to the Durable Object.
-app.all("/mcp/*", rateLimitMiddleware("BURST_LIMITER"), authMiddleware(), async (c) => {
+app.all("/mcp/*", preAuthBurstLimit("BURST_LIMITER"), authMiddleware(), identityRateLimit("RATE_LIMITER"), async (c) => {
   // routeAgentRequest routes to /agents/:agentName/:instanceName
   // For MCP, the McpAgent.serve() static method handles /mcp path
   const response = await routeAgentRequest(c.req.raw, c.env);
@@ -63,12 +65,14 @@ app.all("/mcp/*", rateLimitMiddleware("BURST_LIMITER"), authMiddleware(), async 
 const api = new Hono<{ Bindings: Env }>();
 
 // All API routes require auth + rate limiting
-api.use("*", rateLimitMiddleware("RATE_LIMITER"));
+api.use("*", preAuthBurstLimit("BURST_LIMITER"));
 api.use("*", authMiddleware());
+api.use("*", identityRateLimit("RATE_LIMITER"));
 
 // Template CRUD via REST
 api.get("/templates", requirePermission("template:read"), async (c) => {
-  const list = await c.env.PROMPT_TEMPLATES.list({ prefix: "template:", limit: 100 });
+  const templatesRepo = new TemplateRepository(c.env.PROMPT_TEMPLATES, c.env.TEMPLATE_HMAC_KEY);
+  const list = await templatesRepo.listLatest(100);
   const templates = list.keys
     .filter((k) => !k.name.includes(":v"))
     .map((k) => ({
@@ -81,14 +85,16 @@ api.get("/templates", requirePermission("template:read"), async (c) => {
 
 api.get("/templates/:id", requirePermission("template:read"), async (c) => {
   const id = c.req.param("id");
-  const raw = await c.env.PROMPT_TEMPLATES.get(`template:${id}`, "json");
+  const templatesRepo = new TemplateRepository(c.env.PROMPT_TEMPLATES, c.env.TEMPLATE_HMAC_KEY);
+  const raw = await templatesRepo.getVerified(id);
   if (!raw) return c.json({ error: "Template not found" }, 404);
   return c.json(raw);
 });
 
 api.delete("/templates/:id", requirePermission("template:delete"), async (c) => {
   const id = c.req.param("id");
-  await c.env.PROMPT_TEMPLATES.delete(`template:${id}`);
+  const templatesRepo = new TemplateRepository(c.env.PROMPT_TEMPLATES, c.env.TEMPLATE_HMAC_KEY);
+  await templatesRepo.deletePrimary(id);
   return c.json({ deleted: true, id, note: "Versioned copies retained for audit" });
 });
 
@@ -103,22 +109,9 @@ api.get("/audit", requirePermission("audit:read"), async (c) => {
     offset: parseInt(c.req.query("offset") ?? "0"),
   };
 
-  // Inline query (avoids importing full audit service for simple reads)
-  const conditions: string[] = ["1=1"];
-  const binds: (string | number)[] = [];
+  const result = await queryAuditLogs(c.env.AUDIT_DB, params);
 
-  if (params.userId) { conditions.push("user_id = ?"); binds.push(params.userId); }
-  if (params.templateId) { conditions.push("template_id = ?"); binds.push(params.templateId); }
-  if (params.status) { conditions.push("status = ?"); binds.push(params.status); }
-  if (params.since) { conditions.push("created_at >= ?"); binds.push(params.since); }
-
-  const where = conditions.join(" AND ");
-  const result = await c.env.AUDIT_DB
-    .prepare(`SELECT * FROM prompt_audit_logs WHERE ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`)
-    .bind(...binds, Math.min(params.limit, 200), params.offset)
-    .all();
-
-  return c.json({ logs: result.results ?? [], count: result.results?.length ?? 0 });
+  return c.json({ logs: result.logs, count: result.logs.length, total: result.total });
 });
 
 // ─── HITL Management REST Endpoints ───────────────────────────────

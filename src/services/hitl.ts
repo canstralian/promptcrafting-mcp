@@ -36,6 +36,24 @@ export interface HITLApprovalRequest {
   timeoutMs: number;
 }
 
+
+export type ExecutionGate =
+  | {
+      state: "ready";
+      requestId: string;
+    }
+  | {
+      state: "pending_hitl";
+      requestId: string;
+      expiresAt: string;
+      pollAfterMs: number;
+    }
+  | {
+      state: "blocked";
+      requestId: string;
+      reason: "rejected" | "timed_out";
+    };
+
 export interface HITLDecision {
   approved: boolean;
   reason: "approved" | "rejected" | "timed_out";
@@ -247,6 +265,66 @@ export async function listPendingHITLApprovals(
     context: r.context ? JSON.parse(r.context) : null,
     createdAt: r.created_at,
   }));
+}
+
+
+
+// ─── Resumable Execution Gate ─────────────────────────────────────
+// Returns execution state without blocking the request path.
+export async function ensureExecutionReady(
+  db: D1Database,
+  options: {
+    requestId: string;
+    templateId: string;
+    templateName: string;
+    userId: string;
+    variablesHash: string;
+    timeoutMs: number;
+    requiresHITL: boolean;
+  },
+): Promise<ExecutionGate> {
+  if (!options.requiresHITL) {
+    return { state: "ready", requestId: options.requestId };
+  }
+
+  const existing = await getHITLApprovalStatus(db, options.requestId);
+
+  if (!existing) {
+    await requestHITLApproval(db, {
+      requestId: options.requestId,
+      templateId: options.templateId,
+      templateName: options.templateName,
+      userId: options.userId,
+      variablesHash: options.variablesHash,
+      timeoutMs: options.timeoutMs,
+    });
+
+    return {
+      state: "pending_hitl",
+      requestId: options.requestId,
+      expiresAt: new Date(Date.now() + options.timeoutMs).toISOString(),
+      pollAfterMs: 2_000,
+    };
+  }
+
+  if (existing.status === "approved") {
+    return { state: "ready", requestId: options.requestId };
+  }
+
+  if (existing.status === "pending") {
+    return {
+      state: "pending_hitl",
+      requestId: options.requestId,
+      expiresAt: existing.expiresAt,
+      pollAfterMs: 2_000,
+    };
+  }
+
+  return {
+    state: "blocked",
+    requestId: options.requestId,
+    reason: existing.status === "timed_out" ? "timed_out" : "rejected",
+  };
 }
 
 // ─── Internal: Mark Timed Out + Dead-Letter ────────────────────────
