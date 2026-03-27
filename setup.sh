@@ -13,7 +13,8 @@ for bin in nmap curl whois; do
   if command -v "$bin" >/dev/null 2>&1; then
     echo "found binary: $bin"
   else
-    echo "missing binary: $bin (install via your OS package manager)"
+    echo "missing binary: $bin (install via your OS package manager)" >&2
+    exit 1
   fi
 done
 
