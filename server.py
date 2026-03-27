@@ -82,7 +82,8 @@ def _run_tool(command: list[str], target: str) -> ToolResult:
     if validation_error:
         return _invalid_target_result(cmd_str, validation_error)
 
-    logger.info("executing command=%s", cmd_str)
+    redacted_cmd_str = re.sub(r"(://[^:]+:)[^@]+@", r"\1<redacted>@", cmd_str)
+    logger.info("executing command=%s", redacted_cmd_str)
 
     try:
         completed = subprocess.run(
