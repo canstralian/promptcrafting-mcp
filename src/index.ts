@@ -15,6 +15,9 @@ import { authMiddleware, rateLimitMiddleware, requirePermission } from "./middle
 import {
   resolveHITLApproval, getHITLApprovalStatus, listPendingHITLApprovals,
 } from "./services/hitl.js";
+import { writeTemplateChange } from "./services/audit.js";
+import { hashContent } from "./services/prompt-builder.js";
+import type { PromptTemplate } from "./types.js";
 
 // Re-export the Durable Object class (required by Workers runtime)
 export { PromptMCPServer } from "./mcp-agent.js";
@@ -88,8 +91,36 @@ api.get("/templates/:id", requirePermission("template:read"), async (c) => {
 
 api.delete("/templates/:id", requirePermission("template:delete"), async (c) => {
   const id = c.req.param("id");
+  const userId = c.get("userId") as string;
+
+  const existing = await c.env.PROMPT_TEMPLATES.get(`template:${id}`, "json") as PromptTemplate | null;
+  if (!existing) {
+    return c.json({ error: "Template not found" }, 404);
+  }
+
+  const compiledContent = [
+    existing.layers.role,
+    existing.layers.objective,
+    existing.layers.constraints,
+    existing.layers.outputShape,
+  ].join("\n");
+
+  const contentHash = existing.contentHash ?? await hashContent(compiledContent);
+
   await c.env.PROMPT_TEMPLATES.delete(`template:${id}`);
-  return c.json({ deleted: true, id, note: "Versioned copies retained for audit" });
+
+  await writeTemplateChange(c.env.AUDIT_DB, {
+    templateId: id,
+    action: "delete",
+    userId,
+    version: existing.version ?? 0,
+    contentHash,
+    hmacValid: typeof (existing as { hmacValid?: unknown }).hmacValid === "boolean"
+      ? (existing as { hmacValid: boolean }).hmacValid
+      : false,
+  });
+
+  return c.json({ deleted: true, id, note: "Versioned copies retained for 90 days" });
 });
 
 // Audit logs
