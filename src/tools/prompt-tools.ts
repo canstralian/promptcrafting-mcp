@@ -505,7 +505,9 @@ Fail-closed: if any guardrail fails, the output is NOT returned.`,
       },
     },
     async (params: Record<string, unknown>) => {
-      const requestId = globalThis.crypto?.getRandomValues(new Uint8Array(16)) ?? Array(16).fill(0);
+      const requestId =
+        globalThis.crypto?.getRandomValues(new Uint8Array(16)) ??
+        Array(16).fill(0);
       const startTime = Date.now();
 
       // ── Step 1: Load and verify template ──────────────────────────
@@ -960,7 +962,9 @@ Returns sanitization results, detected threats, compiled prompt preview, and tem
       );
 
       // Sanitize input
-      const { sanitized, verdict, threats } = sanitizeInput(params.userInput as string);
+      const { sanitized, verdict, threats } = sanitizeInput(
+        params.userInput as string,
+      );
 
       // Compile prompt (for preview)
       const { systemPrompt, userPrompt } = compilePrompt(template, {
@@ -1015,7 +1019,10 @@ Status values include hitl_rejected and hitl_timeout for HITL gate decisions.`,
       },
     },
     async (params: Record<string, unknown>) => {
-      const result = await queryAuditLogs(env.AUDIT_DB, params as Record<string, unknown>);
+      const result = await queryAuditLogs(
+        env.AUDIT_DB,
+        params as Record<string, unknown>,
+      );
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     },
   );
