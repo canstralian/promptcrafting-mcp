@@ -1,165 +1,83 @@
-# promptcrafting-mcp
+# Promptcrafting-MCP & ACP Bridge
 
-Security-hardened prompt engineering framework deployed as an MCP server on Cloudflare Workers.
+This repository provides a standardized interface for prompt engineering by layering the **Agent Client Protocol (ACP)** over a **Model Context Protocol (MCP)** server. This allows any ACP-compatible IDE (like Zed or future VS Code extensions) to use specialized prompt validation and refinement tools.
 
-## Architecture
+## Architecture Overview
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  B0: Untrusted Zone                                             │
-│  Clients, Admin UIs, External IdPs                              │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ HTTPS
-┌──────────────────────────▼──────────────────────────────────────┐
-│  B1: Edge Perimeter (Hono Router on Cloudflare Worker)          │
-│  ┌──────────┐ ┌──────────┐ ┌──────────────┐ ┌───────────────┐  │
-│  │ CORS     │→│ Rate     │→│ JWT Auth     │→│ RBAC          │  │
-│  │ Headers  │ │ Limiter  │ │ (alg pinned) │ │ Enforcement   │  │
-│  └──────────┘ └──────────┘ └──────────────┘ └───────────────┘  │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────────┐
-│  B2: Controlled Execution Plane (McpAgent Durable Object)       │
-│  ┌─────────────┐ ┌──────────────┐ ┌────────────┐ ┌──────────┐  │
-│  │ Input       │→│ Structured   │→│ Sandwich   │→│ Prompt   │  │
-│  │ Sanitizer   │ │ Separation   │ │ Defense    │ │ Builder  │  │
-│  └─────────────┘ └──────────────┘ └────────────┘ └────┬─────┘  │
-│                                                        │        │
-│  ┌─────────────┐ ┌──────────────┐ ┌────────────┐      │        │
-│  │ HITL Gate   │←│ PII/Toxicity │←│ Output     │←─────┘        │
-│  │ (optional)  │ │ Redaction    │ │ Validator  │  ← from B4    │
-│  └─────────────┘ └──────────────┘ └────────────┘               │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────────┐
-│  B3: Data Plane                                                 │
-│  ┌───────────────────┐ ┌──────────────────┐ ┌────────────────┐  │
-│  │ Workers KV        │ │ D1 / SQLite      │ │ Cold Storage   │  │
-│  │ Templates+Versions│ │ Audit Logs       │ │ (Optional S3)  │  │
-│  │ HMAC-signed       │ │ Guardrail Events │ │ Compliance     │  │
-│  └───────────────────┘ └──────────────────┘ └────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────────┐
-│  B4: Model Execution (Untrusted)                                │
-│  Workers AI / External LLM Providers                            │
-│  ⚠️  Treat all outputs as untrusted — validate back in B2       │
-└─────────────────────────────────────────────────────────────────┘
-```
+- **ACP Client (IDE):** Handles the user interface, diff rendering, and permission dialogs.
+- **ACP Agent (Bridge):** Orchestrates session logic and communicates with the MCP server.
+- **Promptcrafting-MCP (Server):** The “brain” containing specific logic for validating and refining prompts.
 
-## Four-Layer Prompt Stack
+---
 
-Every prompt is compiled from four structured layers:
+## Prerequisites
 
-| Layer | Purpose | Security Role |
-|-------|---------|---------------|
-| **Objective** | Task definition + success criteria | Defines allowed scope |
-| **Role** | Persona + domain context | Shifts model vocabulary |
-| **Constraints** | Boundaries + forbidden actions | Security policy enforcement |
-| **Output Shape** | Format + schema + examples | Enables Zod validation |
+- **Python 3.10+** (for the MCP Server)
+- **Node.js 20+** (for the ACP Agent)
+- **MCP Python SDK:** `pip install mcp`
+- **ACP/MCP Node SDKs:** `npm install @agent-protocol/sdk @modelcontextprotocol/sdk`
 
-## Quick Start
+---
+
+## Installation & Setup
+
+### 1) MCP Server (Python)
+
+The server exposes the functional tools to the ACP bridge agent.
 
 ```bash
-# 1. Install dependencies
+# Navigate to the server directory
+cd promptcrafting-mcp
+
+# Run the server in stdio mode
+python server.py
+```
+
+### 2) ACP Agent (TypeScript)
+
+The ACP bridge agent must be configured to use your Python executable for launching the MCP server.
+
+```bash
+# Install dependencies
 npm install
 
-# 2. Create Cloudflare resources
-wrangler kv namespace create PROMPT_TEMPLATES
-wrangler d1 create promptcrafting-audit
-
-# 3. Update wrangler.jsonc with the IDs from step 2
-
-# 4. Set secrets
-wrangler secret put JWT_SECRET
-wrangler secret put TEMPLATE_HMAC_KEY
-
-# 5. Run D1 migrations
-npm run db:migrate
-
-# 6. Deploy
-npm run deploy
+# Build the agent
+npm run build
 ```
 
-## Security Controls
+---
 
-| Boundary | Threat | Mitigation | Status |
-|----------|--------|------------|--------|
-| B0→B1 | Spoofing | JWT with algorithm pinning (HS256 only) | ✅ |
-| B0→B1 | DoS | Identity-keyed rate limiting (not IP) | ✅ |
-| B1→B2 | Privilege escalation | RBAC with permission checks | ✅ |
-| B2 | Direct prompt injection | NFKC + regex + entropy analysis | ✅ |
-| B2 | Indirect injection | Structured separation + sandwich defense | ✅ |
-| B2 | Token smuggling | Invisible char stripping + normalization | ✅ |
-| B3 | Template poisoning | HMAC-SHA256 content signing | ✅ |
-| B3 | Repudiation | Immutable D1 audit logs | ✅ |
-| B4 | Prompt extraction | Canary tokens in system prompt | ✅ |
-| B4→B2 | Schema drift | Zod fail-closed output validation | ✅ |
-| B4→B2 | PII leakage | Regex PII detection + redaction | ✅ |
-| B4→B2 | Prompt leakage | System instruction pattern detection | ✅ |
-| B1 | JWT confusion | Algorithm pinning, claim validation | ✅ |
-| B2 | HITL timeout/DoS | Configurable timeout (`HITL_TIMEOUT_MS`), dead-letter on expiry | ✅ |
-| B4 | Response integrity | TLS cert pinning (planned) | 🔲 |
+## Available Tools & Commands
 
-## Endpoints
+| Tool Name | Input | Description |
+|---|---|---|
+| `promptcraft_validate` | `prompt_text` | Checks for PII, length, and injection patterns. |
+| `promptcraft_refine` | `prompt_text`, `target_model` | Transforms raw text into a structured system prompt. |
 
-| Path | Method | Auth | Description |
-|------|--------|------|-------------|
-| `/health` | GET | No | Health check |
-| `/mcp/*` | ALL | JWT | MCP protocol (Streamable HTTP) |
-| `/api/v1/templates` | GET | JWT + `template:read` | List templates |
-| `/api/v1/templates/:id` | GET | JWT + `template:read` | Get template |
-| `/api/v1/templates/:id` | DELETE | JWT + `template:delete` | Delete template |
-| `/api/v1/audit` | GET | JWT + `audit:read` | Query audit logs |
-| `/api/v1/hitl` | GET | JWT + `hitl:resolve` | List pending HITL approvals |
-| `/api/v1/hitl/:requestId` | GET | JWT + `hitl:resolve` | Get HITL approval status |
-| `/api/v1/hitl/:requestId/resolve` | POST | JWT + `hitl:resolve` | Approve or reject HITL request |
+---
 
-## MCP Tools
+## Integration with IDEs
 
-| Tool | Description | Annotations |
-|------|-------------|-------------|
-| `promptcraft_create_template` | Create HMAC-signed four-layer template | write |
-| `promptcraft_get_template` | Retrieve + verify template integrity | read-only |
-| `promptcraft_list_templates` | List templates with pagination | read-only |
-| `promptcraft_delete_template` | Soft-delete (versions retained) | destructive |
-| `promptcraft_execute_prompt` | Full pipeline: sanitize → compile → infer → validate | write |
-| `promptcraft_validate_input` | Dry-run validation (no inference) | read-only |
-| `promptcraft_query_audit` | Query audit trail with filters | read-only |
+When using an ACP-compatible editor, trigger these tools via the command palette or slash commands:
 
-## Project Structure
+- `/refine`: Sends the current buffer to `promptcraft_refine`.
+- `/validate`: Returns a list of security findings in the side panel.
 
-```
-promptcrafting-mcp/
-├── wrangler.jsonc            # Cloudflare config (all bindings)
-├── package.json
-├── tsconfig.json
-├── migrations/
-│   └── 0001_init.sql         # D1 schema
-└── src/
-    ├── index.ts              # Hono router (B1 perimeter)
-    ├── mcp-agent.ts          # McpAgent Durable Object (B2)
-    ├── types.ts              # Shared type definitions
-    ├── schemas/
-    │   └── index.ts          # Zod input schemas
-    ├── middleware/
-    │   └── auth.ts           # JWT, RBAC, rate limiting
-    ├── guardrails/
-    │   ├── index.ts          # Barrel export
-    │   ├── input-sanitizer.ts  # NFKC, injection detection, separation, sandwich
-    │   └── output-validator.ts # Schema, PII, leakage, canary
-    ├── services/
-    │   ├── prompt-builder.ts # Four-layer compiler, HMAC signing
-    │   └── audit.ts          # D1 audit trail operations
-    └── tools/
-        └── prompt-tools.ts   # MCP tool registrations
-```
+---
 
-## Next Steps
+## Security & Permissions
 
-- [ ] STRIDE threat model diagram per boundary
-- [x] HITL gate with configurable timeout + dead-letter path
-- [ ] TLS certificate pinning for external model providers
-- [ ] Integration tests with MCP Inspector
-- [ ] Prompt A/B testing via KV version routing
-- [ ] Cloudflare Firewall for AI integration (semantic input/output scanning)
+This implementation follows the Human-in-the-Loop principle:
+
+- The agent calculates a **Plan**.
+- If a destructive action is required (for example, rewriting a file), the agent issues a `session/request_permission` call.
+- The user must click **Allow** in the IDE before changes are applied to the workspace.
+
+---
+
+## Contributing
+
+- Fork the repository.
+- Add tools in `server.py` within the `@app.list_tools()` decorator.
+- Update logic in `call_tool()` to handle newly added functionality.
+- Test using the included GitHub Actions workflow.
