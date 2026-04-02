@@ -128,7 +128,7 @@ def test_nmap_scan_handles_missing_nmap(tmp_path: Path, monkeypatch: pytest.Monk
 
         monkeypatch.setattr(tooling.subprocess, "run", fake_run)
 
-        with pytest.raises(Exception, match="nmap is not installed"):
+        with pytest.raises(tooling.ValidationError, match="nmap is not installed"):
             tooling.nmap_scan("example.com", "safe", execute=True)
     finally:
         _unload_tooling(tmp_path)
