@@ -17,7 +17,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
     "@types/better-sqlite3": "^7.6.13",
-    "agents": "^0.1.0",
+    "agents": "^0.3.10",
     "better-sqlite3": "^12.8.0",
     "hono": "^4.7.0",
     "zod": "^3.24.0"
